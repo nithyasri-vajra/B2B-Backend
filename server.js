@@ -372,12 +372,13 @@ auth.post("/user-access", async (req, res) => {
         ...options, projection: { _id: 1 },
       }).toArray();
       const found = new Set(clients.map(({ _id }) => String(_id)));
-      if (!assignments.every(({ clientId }) => found.has(clientId))) return 400;
+      if (!assignments.every(({ clientId }) => found.has(clientId))) return "invalid_client_assignment";
     }
     const now = new Date();
     const targetUserId = target?._id ?? new ObjectId();
     if (target) {
-      await users.updateOne({ _id: targetUserId }, { $set: { ...after, updatedAt: now } }, options);
+      const saved = await users.updateOne({ _id: targetUserId }, { $set: { ...after, updatedAt: now } }, options);
+      if (!saved.matchedCount) return 404;
       await sessions.deleteMany({ userId: targetUserId }, options);
     } else {
       await users.insertOne({
@@ -393,6 +394,8 @@ auth.post("/user-access", async (req, res) => {
   }));
   if (result === "reauthentication_required")
     return res.status(403).json({ code: result });
+  if (result === "invalid_client_assignment")
+    return res.status(400).json({ code: result, message: "A selected client no longer exists. Refresh the page and select an available client." });
   if (result !== 200) return res.sendStatus(result);
   res.json({ message: "Access updated." });
 });
