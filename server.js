@@ -326,7 +326,6 @@ auth.get("/users", async (req, res) => {
 auth.post("/user-access", async (req, res) => {
   const { user, session } = await current(req);
   if (!isPlatformAdmin(user)) return res.sendStatus(403);
-  if (!recentStepUp(session)) return res.status(403).json({ code: "reauthentication_required" });
   const { clientAssignments = [], globalRoles = [], reason = "", confirmPlatformAdmin } = req.body ?? {};
   const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
   const action = req.body?.action ?? "assign";
@@ -352,8 +351,8 @@ auth.post("/user-access", async (req, res) => {
     const actor = await users.updateOne({
       _id: user._id, status: "active", globalRoles: "platform_admin",
     }, { $set: { updatedAt: new Date() } }, options);
-    if (!actor.matchedCount || !(await sessions.findOne({ _id: session._id, expiresAt: { $gt: new Date() } }, options)))
-      return 403;
+    const activeSession = await sessions.findOne({ _id: session._id, expiresAt: { $gt: new Date() } }, options);
+    if (!actor.matchedCount || !activeSession) return 403;
     const target = await users.findOne({ email }, options);
     if (action === "pre_add" && target) return 409;
     if (action !== "pre_add" && !target) return 404;
@@ -362,6 +361,8 @@ auth.post("/user-access", async (req, res) => {
     if (target?._id.equals(user._id)) return 403;
     const wasPlatformAdmin = target?.globalRoles?.includes("platform_admin") === true;
     const willBePlatformAdmin = after.globalRoles.includes("platform_admin");
+    if ((action !== "assign" || wasPlatformAdmin || willBePlatformAdmin) && !recentStepUp(activeSession))
+      return "reauthentication_required";
     if (wasPlatformAdmin !== willBePlatformAdmin && (confirmPlatformAdmin !== true || !reason.trim()))
       return 400;
     if (assigning && assignments.length) {
@@ -390,6 +391,8 @@ auth.post("/user-access", async (req, res) => {
     }, options);
     return 200;
   }));
+  if (result === "reauthentication_required")
+    return res.status(403).json({ code: result });
   if (result !== 200) return res.sendStatus(result);
   res.json({ message: "Access updated." });
 });
