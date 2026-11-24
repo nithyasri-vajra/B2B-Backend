@@ -159,7 +159,7 @@ auth.get("/callback", async (req, res) => {
       return deny();
     await sessions.updateOne({ _id: session._id }, { $set: { lastReauthenticatedAt: now, lastActiveAt: now } });
     await audit("reauthentication", "success", user._id);
-    return res.redirect(origin + "/");
+    return res.redirect(origin + "/?accessReauthenticated=1#requests");
   }
   if (!user) {
     const bootstrap = email === PLATFORM_ADMIN_EMAIL?.toLowerCase();
@@ -275,14 +275,52 @@ const recentStepUp = (session) =>
 const accessSnapshot = ({ status, globalRoles = [], clientAssignments = [] }) =>
   ({ status, globalRoles, clientAssignments });
 
+auth.get("/clients", async (req, res) => {
+  const { user } = await current(req);
+  if (user?.status !== "active") return res.sendStatus(403);
+  const filter = isPlatformAdmin(user) ? {} : {
+    _id: { $in: (user.clientAssignments ?? []).flatMap(({ clientId }) => {
+      const id = String(clientId);
+      return ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id];
+    }) },
+  };
+  const clients = await db.collection("clients").find(filter, {
+    projection: { name: 1, channel: 1, archived: 1, website: 1, industry: 1, timezone: 1, language: 1 },
+  }).toArray();
+  res.json({ data: { clients: clients.map(({ _id, ...client }) => ({ id: String(_id), ...client })) } });
+});
+
+auth.post("/clients", async (req, res) => {
+  const { user } = await current(req);
+  if (!isPlatformAdmin(user)) return res.sendStatus(403);
+  const profile = Object.fromEntries(["name", "website", "industry", "timezone", "language"]
+    .map((field) => [field, typeof req.body?.[field] === "string" ? req.body[field].trim() : ""]));
+  if (!profile.name || Object.values(profile).some((value) => value.length > 2000))
+    return res.status(400).json({ message: "Enter a valid client profile." });
+  const clients = db.collection("clients");
+  const existing = await clients.findOne({ name: profile.name, archived: { $ne: true } },
+    { collation: { locale: "en", strength: 2 } });
+  if (existing) return res.status(409).json({ message: "A client with this name already exists." });
+  const { insertedId } = await clients.insertOne(profile);
+  res.status(201).json({ data: { clients: [{ id: String(insertedId), ...profile }] } });
+});
+
 auth.get("/users", async (req, res) => {
   const { user } = await current(req);
   if (!isPlatformAdmin(user)) return res.sendStatus(403);
   const statuses = ["active", "pending", "suspended", "deactivated"];
   if (req.query.status !== undefined && !statuses.includes(req.query.status)) return res.sendStatus(400);
+  const offset = Number(req.query.offset ?? 0);
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647)
+    return res.sendStatus(400);
   const filter = req.query.status ? { status: req.query.status } : {};
-  const records = await users.find(filter, { projection: { googleSub: 0 } }).limit(250).toArray();
-  res.json({ data: { users: records } });
+  const pageSize = 250;
+  const records = await users.find(filter, { projection: { googleSub: 0 } })
+    .sort({ _id: 1 }).skip(offset).limit(pageSize + 1).toArray();
+  res.json({ data: {
+    users: records.slice(0, pageSize),
+    nextOffset: records.length > pageSize ? offset + pageSize : null,
+  } });
 });
 
 auth.post("/user-access", async (req, res) => {
