@@ -327,11 +327,11 @@ auth.post("/user-access", async (req, res) => {
   const { user, session } = await current(req);
   if (!isPlatformAdmin(user)) return res.sendStatus(403);
   if (!recentStepUp(session)) return res.status(403).json({ code: "reauthentication_required" });
-  const { clientAssignments = [], globalRoles = [], reason, confirmPlatformAdmin } = req.body ?? {};
+  const { clientAssignments = [], globalRoles = [], reason = "", confirmPlatformAdmin } = req.body ?? {};
   const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
   const action = req.body?.action ?? "assign";
   const assigning = ["assign", "pre_add"].includes(action);
-  if (!companyEmail.test(email) || typeof reason !== "string" || !reason.trim() || reason.length > 2000 ||
+  if (!companyEmail.test(email) || typeof reason !== "string" || reason.length > 2000 ||
       !["assign", "pre_add", "suspend", "decline"].includes(action) ||
       !Array.isArray(globalRoles) || globalRoles.length > 1 ||
       !globalRoles.every((role) => role === "platform_admin") ||
@@ -360,7 +360,9 @@ auth.post("/user-access", async (req, res) => {
     if (action === "decline" && target.status !== "pending") return 409;
     if (assigning && target?.status === "deactivated") return 409;
     if (target?._id.equals(user._id)) return 403;
-    if ((target?.globalRoles?.includes("platform_admin") || globalRoles.length) && confirmPlatformAdmin !== true)
+    const wasPlatformAdmin = target?.globalRoles?.includes("platform_admin") === true;
+    const willBePlatformAdmin = after.globalRoles.includes("platform_admin");
+    if (wasPlatformAdmin !== willBePlatformAdmin && (confirmPlatformAdmin !== true || !reason.trim()))
       return 400;
     if (assigning && assignments.length) {
       const ids = assignments.flatMap(({ clientId }) =>
