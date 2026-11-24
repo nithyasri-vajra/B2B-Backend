@@ -376,32 +376,40 @@ auth.post("/user-access", async (req, res) => {
     }
     const now = new Date();
     const targetUserId = target?._id ?? new ObjectId();
+    let savedUser;
     if (target) {
-      const saved = await users.updateOne({ _id: targetUserId }, { $set: { ...after, updatedAt: now } }, options);
-      if (!saved.matchedCount) return 404;
+      savedUser = await users.findOneAndUpdate(
+        { _id: targetUserId }, { $set: { ...after, updatedAt: now } },
+        { ...options, returnDocument: "after", projection: { googleSub: 0 } },
+      );
+      if (!savedUser) return 404;
       await sessions.deleteMany({ userId: targetUserId }, options);
     } else {
-      await users.insertOne({
+      savedUser = {
         _id: targetUserId, googleSub: null, email, name: email, ...after,
         accessRequestedAt: null, accessRequestNote: null, accessRequestNoteAt: null, createdAt: now, updatedAt: now,
-      }, options);
+      };
+      await users.insertOne(savedUser, options);
     }
     await audits.insertOne({
       eventType: "user_access_changed", outcome: "success", actorUserId: user._id, targetUserId, occurredAt: now,
       details: { action, reason: reason.trim(), before: target ? accessSnapshot(target) : null, after },
     }, options);
-    return 200;
+    const { googleSub, ...record } = savedUser;
+    return record;
   }));
   if (result === "reauthentication_required")
     return res.status(403).json({ code: result });
   if (result === "invalid_client_assignment")
     return res.status(400).json({ code: result, message: "A selected client no longer exists. Refresh the page and select an available client." });
-  if (result !== 200) return res.sendStatus(result);
-  res.json({ message: "Access updated." });
+  if (typeof result === "number") return res.sendStatus(result);
+  res.json({ message: "Access updated.", data: { users: [result] } });
 });
 
 app.use((error, req, res, next) => {
   console.error("Auth request failed", error.code ?? error.name);
+  if (req.method === "POST" && req.originalUrl === path + "/user-access" && error.code === 121)
+    return res.status(422).json({ message: "MongoDB rejected the access change because it does not match the database schema." });
   const status = error.code === 11000 ? 409 : error.status === 400 || error.status === 413 ? error.status : 500;
   res.status(status).json({ message: "Could not complete the authentication request." });
 });
