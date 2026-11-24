@@ -80,6 +80,22 @@ const roles = {
   viewer: "Viewer",
 };
 
+const isPlatformAdmin = (user) =>
+  user?.status === "active" && Array.isArray(user.globalRoles) &&
+  user.globalRoles.includes("platform_admin");
+const validClientAssignments = (user) =>
+  (Array.isArray(user?.clientAssignments) ? user.clientAssignments : []).filter(
+    (entry) => entry?.clientId != null && String(entry.clientId).length > 0 &&
+      Array.isArray(entry.roles) && entry.roles.some((role) => Object.hasOwn(roles, role)),
+  );
+const hasClientRole = (user, clientId, allowedRoles) =>
+  user?.status === "active" && typeof clientId === "string" && clientId.length > 0 &&
+  validClientAssignments(user).some((entry) =>
+    String(entry.clientId) === clientId && entry.roles.some((role) => allowedRoles.includes(role)),
+  );
+const clientIdentifiers = (id) => ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id];
+const hasRole = (user) => isPlatformAdmin(user) || validClientAssignments(user).length > 0;
+
 async function current(req) {
   const raw = cookie(req, "b2b_session");
   if (!raw) return {};
@@ -99,7 +115,7 @@ auth.post("/sign-in", async (req, res) => {
   const nonce = token();
   const verifier = token();
   const { user, session } = req.body?.reauthenticate === true ? await current(req) : {};
-  if (req.body?.reauthenticate === true && user?.status !== "active") return res.sendStatus(403);
+  if (req.body?.reauthenticate === true && (user?.status !== "active" || !hasRole(user))) return res.sendStatus(403);
   attempts.set(state, { nonce, verifier, userId: user?._id, sessionId: session?._id, startedAt: now, expires: now + stepUpMs });
   res.cookie("b2b_oauth", state, { ...cookieOptions, maxAge: 300000 });
   res.clearCookie("b2b_denied", cookieOptions);
@@ -153,7 +169,7 @@ auth.get("/callback", async (req, res) => {
   let user = await users.findOne({ googleSub: claims.sub });
   if (attempt.userId) {
     const { session } = await current(req);
-    if (!user?._id.equals(attempt.userId) || user.status !== "active" ||
+    if (!user?._id.equals(attempt.userId) || user.status !== "active" || !hasRole(user) ||
         !session?._id.equals(attempt.sessionId) || !Number.isInteger(claims.auth_time) ||
         claims.auth_time * 1000 < attempt.startedAt - 1000)
       return deny();
@@ -223,13 +239,13 @@ auth.get("/session", async (req, res) => {
   const { session, user } = await current(req);
   if (!session) return reply(cookie(req, "b2b_session") ? { status: "expired" } : null);
   if (!user || !["active", "pending"].includes(user.status)) return reply({ status: "denied" });
-  const isAdmin = user.globalRoles?.includes("platform_admin");
-  const assignments = user.clientAssignments ?? [];
+  const isAdmin = isPlatformAdmin(user);
+  const assignments = validClientAssignments(user);
   const assignedRoles = assignments.flatMap(({ roles }) => roles);
   const role = isAdmin ? "Platform Admin" : Object.keys(roles)
     .filter((key) => assignedRoles.includes(key)).map((key) => roles[key])[0];
   return reply({
-    status: role ? user.status : "pending", email: user.email, name: user.name,
+    status: role && user.status === "active" ? "active" : "pending", email: user.email, name: user.name,
     role, clientIds: assignments.map(({ clientId }) => String(clientId)),
     globalRoles: user.globalRoles ?? [], clientAssignments: assignments,
   });
@@ -239,9 +255,7 @@ auth.get("/session", async (req, res) => {
 auth.post("/approval-session", async (req, res) => {
   const { user, session } = await current(req);
   if (!session) return res.sendStatus(401);
-  if (user?.status !== "active" || typeof req.body?.clientId !== "string" ||
-      !user.clientAssignments?.some(({ clientId, roles }) =>
-        String(clientId) === req.body.clientId && roles.includes("approver")))
+  if (!hasClientRole(user, req.body?.clientId, ["approver"]))
     return res.sendStatus(403);
   const now = new Date();
   if (now - session.lastActiveAt >= approvalIdleMs ||
@@ -253,11 +267,17 @@ auth.post("/approval-session", async (req, res) => {
 
 auth.post("/request-access", async (req, res) => {
   const { user } = await current(req);
-  if (user?.status !== "pending") return res.sendStatus(403);
+  if (user?.status !== "pending" && (user?.status !== "active" || hasRole(user)))
+    return res.sendStatus(403);
   const note = req.body?.note;
   if (typeof note !== "string" || !note.trim() || note.length > 2000) return res.sendStatus(400);
   const now = new Date();
-  const result = await users.updateOne({ _id: user._id, status: "pending" }, {
+  const result = await users.updateOne({
+    _id: user._id,
+    status: user.status,
+    globalRoles: user.globalRoles ?? null,
+    clientAssignments: user.clientAssignments ?? null,
+  }, {
     $set: { accessRequestNote: note.trim(), accessRequestNoteAt: now, updatedAt: now },
   });
   if (!result.matchedCount) return res.sendStatus(409);
@@ -272,8 +292,6 @@ auth.post("/sign-out", async (req, res) => {
   res.sendStatus(204);
 });
 
-const isPlatformAdmin = (user) =>
-  user?.status === "active" && user.globalRoles?.includes("platform_admin");
 const recentStepUp = (session) =>
   session.lastReauthenticatedAt instanceof Date && Date.now() - session.lastReauthenticatedAt <= stepUpMs;
 const accessSnapshot = ({ status, globalRoles = [], clientAssignments = [] }) =>
@@ -281,12 +299,9 @@ const accessSnapshot = ({ status, globalRoles = [], clientAssignments = [] }) =>
 
 auth.get("/clients", async (req, res) => {
   const { user } = await current(req);
-  if (user?.status !== "active") return res.sendStatus(403);
+  if (user?.status !== "active" || !hasRole(user)) return res.sendStatus(403);
   const filter = isPlatformAdmin(user) ? {} : {
-    _id: { $in: (user.clientAssignments ?? []).flatMap(({ clientId }) => {
-      const id = String(clientId);
-      return ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id];
-    }) },
+    _id: { $in: validClientAssignments(user).flatMap(({ clientId }) => clientIdentifiers(String(clientId))) },
   };
   const clients = await db.collection("clients").find(filter, {
     projection: { name: 1, channel: 1, archived: 1, website: 1, industry: 1, timezone: 1, language: 1 },
@@ -329,22 +344,44 @@ auth.get("/users", async (req, res) => {
 
 auth.get("/audit", async (req, res) => {
   const { user } = await current(req);
-  if (!isPlatformAdmin(user)) return res.sendStatus(403);
+  const { clientId } = req.query;
+  const platformAdmin = isPlatformAdmin(user);
+  if (!platformAdmin && !hasClientRole(user, clientId, ["knowledge_admin", "approver"]))
+    return res.sendStatus(403);
   const offset = Number(req.query.offset ?? 0);
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647)
     return res.sendStatus(400);
   const pageSize = 250;
+  const ids = platformAdmin ? [] : clientIdentifiers(clientId);
+  const clientScope = platformAdmin ? [] : [{
+    $match: { $or: [
+      { clientId: { $in: ids } },
+      { "details.before.clientAssignments.clientId": { $in: ids } },
+      { "details.after.clientAssignments.clientId": { $in: ids } },
+    ] },
+  }];
+  const scopedAssignments = (side) => ({
+    clientAssignments: { $filter: {
+      input: { $ifNull: ["$details." + side + ".clientAssignments", []] },
+      as: "assignment",
+      cond: { $in: ["$$assignment.clientId", ids] },
+    } },
+  });
   const rows = await audits.aggregate([
+    ...clientScope,
     { $sort: { occurredAt: -1, _id: -1 } },
     { $skip: offset },
     { $limit: pageSize + 1 },
     { $lookup: { from: "users", localField: "actorUserId", foreignField: "_id", as: "actor" } },
     { $lookup: { from: "users", localField: "targetUserId", foreignField: "_id", as: "target" } },
     { $project: {
-      occurredAt: 1, eventType: 1, outcome: 1, clientId: 1, ip: 1, device: 1,
+      occurredAt: 1, eventType: 1, outcome: 1,
+      ...(platformAdmin ? { clientId: 1, ip: 1, device: 1 } : { clientId: { $literal: clientId } }),
       actor: { $arrayElemAt: ["$actor.email", 0] },
       target: { $arrayElemAt: ["$target.email", 0] },
-      "details.before": 1, "details.after": 1,
+      ...(platformAdmin ? { "details.before": 1, "details.after": 1 } : {
+        details: { before: scopedAssignments("before"), after: scopedAssignments("after") },
+      }),
     } },
   ]).toArray();
   res.json({ data: {
