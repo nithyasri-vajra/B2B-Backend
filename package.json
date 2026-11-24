@@ -1,0 +1,14 @@
+{
+  "name": "b2b-auth-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:init": "node --env-file=.env server.js --init-db",
+    "start": "node --env-file=.env server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "google-auth-library": "^10.0.0",
+    "mongodb": "^6.0.0"
+  }
+}
