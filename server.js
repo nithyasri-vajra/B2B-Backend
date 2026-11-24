@@ -323,6 +323,32 @@ auth.get("/users", async (req, res) => {
   } });
 });
 
+auth.get("/audit", async (req, res) => {
+  const { user } = await current(req);
+  if (!isPlatformAdmin(user)) return res.sendStatus(403);
+  const offset = Number(req.query.offset ?? 0);
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647)
+    return res.sendStatus(400);
+  const pageSize = 250;
+  const rows = await audits.aggregate([
+    { $sort: { occurredAt: -1, _id: -1 } },
+    { $skip: offset },
+    { $limit: pageSize + 1 },
+    { $lookup: { from: "users", localField: "actorUserId", foreignField: "_id", as: "actor" } },
+    { $lookup: { from: "users", localField: "targetUserId", foreignField: "_id", as: "target" } },
+    { $project: {
+      occurredAt: 1, eventType: 1, outcome: 1, clientId: 1, ip: 1, device: 1,
+      actor: { $arrayElemAt: ["$actor.email", 0] },
+      target: { $arrayElemAt: ["$target.email", 0] },
+      "details.before": 1, "details.after": 1,
+    } },
+  ]).toArray();
+  res.json({ data: {
+    audit: rows.slice(0, pageSize),
+    nextOffset: rows.length > pageSize ? offset + pageSize : null,
+  } });
+});
+
 auth.post("/user-access", async (req, res) => {
   const { user, session } = await current(req);
   if (!isPlatformAdmin(user)) return res.sendStatus(403);
@@ -391,10 +417,15 @@ auth.post("/user-access", async (req, res) => {
       };
       await users.insertOne(savedUser, options);
     }
-    await audits.insertOne({
-      eventType: "user_access_changed", outcome: "success", actorUserId: user._id, targetUserId, occurredAt: now,
-      details: { action, reason: reason.trim(), before: target ? accessSnapshot(target) : null, after },
-    }, options);
+    try {
+      await audits.insertOne({
+        eventType: "user_access_changed", outcome: "success", actorUserId: user._id, targetUserId, occurredAt: now,
+        details: { action, reason: reason.trim(), before: target ? accessSnapshot(target) : null, after },
+      }, options);
+    } catch (error) {
+      if (error.code === 121) error.accessAuditValidationFailed = true;
+      throw error;
+    }
     const { googleSub, ...record } = savedUser;
     return record;
   }));
@@ -409,7 +440,9 @@ auth.post("/user-access", async (req, res) => {
 app.use((error, req, res, next) => {
   console.error("Auth request failed", error.code ?? error.name);
   if (req.method === "POST" && req.originalUrl === path + "/user-access" && error.code === 121)
-    return res.status(422).json({ message: "MongoDB rejected the access change because it does not match the database schema." });
+    return res.status(422).json({ message: error.accessAuditValidationFailed
+      ? "MongoDB rejected the audit record. The role change was rolled back."
+      : "MongoDB rejected the user update because it does not match the users collection schema." });
   const status = error.code === 11000 ? 409 : error.status === 400 || error.status === 413 ? error.status : 500;
   res.status(status).json({ message: "Could not complete the authentication request." });
 });
