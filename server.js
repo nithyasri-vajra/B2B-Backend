@@ -98,9 +98,9 @@ auth.post("/sign-in", async (req, res) => {
   const state = token();
   const nonce = token();
   const verifier = token();
-  const { user } = req.body?.reauthenticate === true ? await current(req) : {};
+  const { user, session } = req.body?.reauthenticate === true ? await current(req) : {};
   if (req.body?.reauthenticate === true && user?.status !== "active") return res.sendStatus(403);
-  attempts.set(state, { nonce, verifier, userId: user?._id, startedAt: now, expires: now + stepUpMs });
+  attempts.set(state, { nonce, verifier, userId: user?._id, sessionId: session?._id, startedAt: now, expires: now + stepUpMs });
   res.cookie("b2b_oauth", state, { ...cookieOptions, maxAge: 300000 });
   res.clearCookie("b2b_denied", cookieOptions);
   const url = new URL(google.generateAuthUrl({
@@ -154,10 +154,14 @@ auth.get("/callback", async (req, res) => {
   if (attempt.userId) {
     const { session } = await current(req);
     if (!user?._id.equals(attempt.userId) || user.status !== "active" ||
-        !session?.userId.equals(attempt.userId) || !Number.isInteger(claims.auth_time) ||
+        !session?._id.equals(attempt.sessionId) || !Number.isInteger(claims.auth_time) ||
         claims.auth_time * 1000 < attempt.startedAt - 1000)
       return deny();
-    await sessions.updateOne({ _id: session._id }, { $set: { lastReauthenticatedAt: now, lastActiveAt: now } });
+    const verified = await sessions.updateOne(
+      { _id: session._id, expiresAt: { $gt: now } },
+      { $set: { lastReauthenticatedAt: now, lastActiveAt: now } },
+    );
+    if (!verified.matchedCount) return deny("sign_in_failed");
     await audit("reauthentication", "success", user._id);
     return res.redirect(origin + "/?accessReauthenticated=1#requests");
   }
@@ -352,12 +356,13 @@ auth.get("/audit", async (req, res) => {
 auth.post("/user-access", async (req, res) => {
   const { user, session } = await current(req);
   if (!isPlatformAdmin(user)) return res.sendStatus(403);
-  const { clientAssignments = [], globalRoles = [], reason = "", confirmPlatformAdmin } = req.body ?? {};
+  const { clientAssignments = [], globalRoles = [], reason = "", confirmPlatformAdmin, clientId } = req.body ?? {};
   const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
   const action = req.body?.action ?? "assign";
   const assigning = ["assign", "pre_add"].includes(action);
   if (!companyEmail.test(email) || typeof reason !== "string" || reason.length > 2000 ||
-      !["assign", "pre_add", "suspend", "decline"].includes(action) ||
+      !["assign", "pre_add", "suspend", "decline", "remove_client"].includes(action) ||
+      (action === "remove_client" && (typeof clientId !== "string" || !clientId.trim())) ||
       !Array.isArray(globalRoles) || globalRoles.length > 1 ||
       !globalRoles.every((role) => role === "platform_admin") ||
       !Array.isArray(clientAssignments) ||
@@ -369,7 +374,7 @@ auth.post("/user-access", async (req, res) => {
   const assignments = clientAssignments.map(({ clientId, roles }) => ({ clientId, roles: [...new Set(roles)] }));
   const active = assigning && (globalRoles.length > 0 || assignments.length > 0);
   const status = assigning ? (active ? "active" : "pending") : "suspended";
-  const after = { status, globalRoles: assigning ? globalRoles : [], clientAssignments: assigning ? assignments : [] };
+  const requestedAccess = { status, globalRoles: assigning ? globalRoles : [], clientAssignments: assigning ? assignments : [] };
 
   const result = await mongo.withSession((tx) => tx.withTransaction(async () => {
     const options = { session: tx };
@@ -386,8 +391,20 @@ auth.post("/user-access", async (req, res) => {
     if (assigning && target?.status === "deactivated") return 409;
     if (target?._id.equals(user._id)) return 403;
     const wasPlatformAdmin = target?.globalRoles?.includes("platform_admin") === true;
+    let after = requestedAccess;
+    if (action === "remove_client") {
+      if (wasPlatformAdmin || ["suspended", "deactivated"].includes(target.status)) return 409;
+      const assigned = target.clientAssignments ?? [];
+      const remaining = assigned.filter((entry) => String(entry.clientId) !== clientId);
+      if (remaining.length === assigned.length) return 409;
+      after = {
+        status: remaining.length ? target.status : "pending",
+        globalRoles: target.globalRoles ?? [],
+        clientAssignments: remaining,
+      };
+    }
     const willBePlatformAdmin = after.globalRoles.includes("platform_admin");
-    if ((action !== "assign" || wasPlatformAdmin || willBePlatformAdmin) && !recentStepUp(activeSession))
+    if (!recentStepUp(activeSession))
       return "reauthentication_required";
     if (wasPlatformAdmin !== willBePlatformAdmin && (confirmPlatformAdmin !== true || !reason.trim()))
       return 400;
