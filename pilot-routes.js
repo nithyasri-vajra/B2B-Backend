@@ -8,12 +8,14 @@ const validId = (id) => typeof id === "string" && /^[a-f0-9]{24}$/i.test(id);
 
 export function registerPilotRoutes(router, { db, mongo, current, isPlatformAdmin, hasClientRole }) {
   async function pilotScope() {
-    const client = await db.collection("clients").findOne({ slug: "vajra-global", status: "active" });
-    if (!client) return null;
     const project = await db.collection("projects").findOne({
-      slug: "linkedin-content-pilot", clientId: client._id, status: "active",
+      slug: "linkedin-content-pilot", status: "active",
     });
-    return project && { clientId: client._id, projectId: project._id };
+    if (!project || !ObjectId.isValid(project.clientId)) return null;
+    const client = await db.collection("brands").findOne({
+      _id: new ObjectId(project.clientId), status: "active",
+    });
+    return client && { clientId: project.clientId, projectId: project._id };
   }
 
   router.post("/run-context", async (req, res) => {
@@ -82,6 +84,8 @@ export function registerPilotRoutes(router, { db, mongo, current, isPlatformAdmi
       await mongo.withSession((session) => session.withTransaction(async () => {
         await db.collection("runs").insertOne({
           ...scope, _id: runId, kind: "context-assembly", status: "completed",
+          ownerUserId: user._id, briefId: brief._id, briefVersion: briefVersion.version,
+          ...(knowledgeObjectIds.length === 1 ? { knowledgeVersionId: knowledgeObjectIds[0] } : {}),
           startedAt, finishedAt, openAIResponseId: result.id,
         }, { session });
         await db.collection("stageExecutions").insertOne({

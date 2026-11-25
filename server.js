@@ -4,6 +4,7 @@ import { OAuth2Client } from "google-auth-library";
 import { MongoClient, ObjectId } from "mongodb";
 import { registerPilotRoutes } from "./pilot-routes.js";
 import { registerWorkflowRoutes } from "./workflow-routes.js";
+import { registerBrandRoutes } from "./brand-routes.js";
 
 const { MONGODB_URI, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, APP_ORIGIN, PLATFORM_ADMIN_EMAIL } = process.env;
 const initOnly = process.argv.includes("--init-db");
@@ -305,10 +306,13 @@ auth.get("/clients", async (req, res) => {
   const filter = isPlatformAdmin(user) ? {} : {
     _id: { $in: validClientAssignments(user).flatMap(({ clientId }) => clientIdentifiers(String(clientId))) },
   };
-  const clients = await db.collection("clients").find(filter, {
-    projection: { name: 1, channel: 1, archived: 1, website: 1, industry: 1, timezone: 1, language: 1 },
+  const clients = await db.collection("brands").find(filter, {
+    projection: { name: 1, channels: 1, status: 1, website: 1, industry: 1, timezone: 1, spelling: 1 },
   }).toArray();
-  res.json({ data: { clients: clients.map(({ _id, ...client }) => ({ id: String(_id), ...client })) } });
+  res.json({ data: { clients: clients.map(({ _id, ...client }) => ({
+    id: String(_id), ...client, archived: client.status === "archived",
+    channel: client.channels?.[0]?.type, language: client.spelling,
+  })) } });
 });
 
 auth.post("/clients", async (req, res) => {
@@ -316,14 +320,40 @@ auth.post("/clients", async (req, res) => {
   if (!isPlatformAdmin(user)) return res.sendStatus(403);
   const profile = Object.fromEntries(["name", "website", "industry", "timezone", "language"]
     .map((field) => [field, typeof req.body?.[field] === "string" ? req.body[field].trim() : ""]));
-  if (!profile.name || Object.values(profile).some((value) => value.length > 2000))
+  const { brandManagerUserId } = req.body ?? {};
+  const spelling = typeof req.body?.spelling === "string" ? req.body.spelling.trim() : profile.language;
+  if (!profile.name || !profile.website || !profile.timezone ||
+      Object.values(profile).some((value) => value.length > 2000) || spelling.length > 2000 ||
+      typeof brandManagerUserId !== "string" || !ObjectId.isValid(brandManagerUserId))
     return res.status(400).json({ message: "Enter a valid client profile." });
-  const clients = db.collection("clients");
-  const existing = await clients.findOne({ name: profile.name, archived: { $ne: true } },
+  const managerId = new ObjectId(brandManagerUserId);
+  const clients = db.collection("brands");
+  const existing = await clients.findOne({ name: profile.name, status: { $ne: "archived" } },
     { collation: { locale: "en", strength: 2 } });
   if (existing) return res.status(409).json({ message: "A client with this name already exists." });
-  const { insertedId } = await clients.insertOne(profile);
-  res.status(201).json({ data: { clients: [{ id: String(insertedId), ...profile }] } });
+  const now = new Date();
+  const brand = {
+    _id: new ObjectId(), name: profile.name, website: profile.website, industry: profile.industry || null,
+    timezone: profile.timezone, spelling: spelling || null,
+    status: "setting_up", brandManagerUserId: managerId, agents: [], channels: [],
+    createdAt: now, updatedAt: now,
+  };
+  const saved = await mongo.withSession((session) => session.withTransaction(async () => {
+    const manager = await users.updateOne({ _id: managerId, status: "active" }, {
+      $push: { clientAssignments: {
+        clientId: String(brand._id), roles: ["knowledge_admin"], assignedByUserId: user._id, assignedAt: now,
+      } }, $set: { updatedAt: now },
+    }, { session });
+    if (!manager.matchedCount) return false;
+    await clients.insertOne(brand, { session });
+    await audits.insertOne({
+      clientId: brand._id, eventType: "brand_created", outcome: "success",
+      targetType: "brand", targetId: brand._id, actorUserId: user._id, occurredAt: now, details: {},
+    }, { session });
+    return true;
+  }));
+  if (!saved) return res.status(400).json({ message: "Select an active Brand Manager." });
+  res.status(201).json({ data: { clients: [{ ...brand, id: String(brand._id), language: brand.spelling }] } });
 });
 
 auth.get("/users", async (req, res) => {
@@ -448,11 +478,20 @@ auth.post("/user-access", async (req, res) => {
     if (assigning && assignments.length) {
       const ids = assignments.flatMap(({ clientId }) =>
         ObjectId.isValid(clientId) ? [clientId, new ObjectId(clientId)] : [clientId]);
-      const clients = await db.collection("clients").find({ _id: { $in: ids } }, {
+      const clients = await db.collection("brands").find({ _id: { $in: ids }, status: { $ne: "archived" } }, {
         ...options, projection: { _id: 1 },
       }).toArray();
       const found = new Set(clients.map(({ _id }) => String(_id)));
       if (!assignments.every(({ clientId }) => found.has(clientId))) return "invalid_client_assignment";
+      after = { ...after, clientAssignments: assignments.map((assignment) => {
+        const previous = target?.clientAssignments?.find((entry) => String(entry.clientId) === assignment.clientId);
+        const unchanged = previous?.roles?.length === assignment.roles.length &&
+          assignment.roles.every((role) => previous.roles.includes(role));
+        return {
+          ...assignment, assignedByUserId: unchanged ? previous.assignedByUserId ?? user._id : user._id,
+          assignedAt: unchanged ? previous.assignedAt ?? new Date() : new Date(),
+        };
+      }) };
     }
     const now = new Date();
     const targetUserId = target?._id ?? new ObjectId();
@@ -491,7 +530,8 @@ auth.post("/user-access", async (req, res) => {
 });
 
 registerPilotRoutes(auth, { db, mongo, current, isPlatformAdmin, hasClientRole });
-registerWorkflowRoutes(auth, { db, current, isPlatformAdmin, hasClientRole });
+registerWorkflowRoutes(auth, { db, mongo, current, isPlatformAdmin, hasClientRole, recentStepUp });
+registerBrandRoutes(auth, { db, mongo, current, isPlatformAdmin, hasClientRole });
 
 app.use((error, req, res, next) => {
   console.error("Auth request failed", error.code ?? error.name);
@@ -499,6 +539,8 @@ app.use((error, req, res, next) => {
     return res.status(422).json({ message: error.accessAuditValidationFailed
       ? "MongoDB rejected the audit record. The role change was rolled back."
       : "MongoDB rejected the user update because it does not match the users collection schema." });
+  if (error.code === 121)
+    return res.status(422).json({ message: "The record does not match the database schema." });
   const status = error.code === 11000 ? 409 : error.status === 400 || error.status === 413 ? error.status : 500;
   res.status(status).json({ message: "Could not complete the authentication request." });
 });
