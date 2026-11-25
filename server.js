@@ -465,7 +465,7 @@ auth.post("/user-access", async (req, res) => {
         { ...options, returnDocument: "after", projection: { googleSub: 0 } },
       );
       if (!savedUser) return 404;
-      await sessions.deleteMany({ userId: targetUserId }, options);
+      if (!assigning) await sessions.deleteMany({ userId: targetUserId }, options);
     } else {
       savedUser = {
         _id: targetUserId, googleSub: null, email, name: email, ...after,
