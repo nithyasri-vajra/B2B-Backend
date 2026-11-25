@@ -443,7 +443,7 @@ auth.post("/user-access", async (req, res) => {
       };
     }
     const willBePlatformAdmin = after.globalRoles.includes("platform_admin");
-    if (!recentStepUp(activeSession))
+    if (!assigning && !recentStepUp(activeSession))
       return "reauthentication_required";
     if (wasPlatformAdmin !== willBePlatformAdmin && (confirmPlatformAdmin !== true || !reason.trim()))
       return 400;
@@ -490,7 +490,7 @@ auth.post("/user-access", async (req, res) => {
   if (result === "invalid_client_assignment")
     return res.status(400).json({ code: result, message: "A selected client no longer exists. Refresh the page and select an available client." });
   if (typeof result === "number") return res.sendStatus(result);
-  res.json({ message: "Access updated.", data: { users: [result] } });
+  res.json({ message: assigning ? "User access saved." : "Access updated.", data: { users: [result] } });
 });
 
 registerPilotRoutes(auth, { db, mongo, current, isPlatformAdmin, hasClientRole });
