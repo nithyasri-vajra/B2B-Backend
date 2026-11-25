@@ -443,8 +443,6 @@ auth.post("/user-access", async (req, res) => {
       };
     }
     const willBePlatformAdmin = after.globalRoles.includes("platform_admin");
-    if (!assigning && !recentStepUp(activeSession))
-      return "reauthentication_required";
     if (wasPlatformAdmin !== willBePlatformAdmin && (confirmPlatformAdmin !== true || !reason.trim()))
       return 400;
     if (assigning && assignments.length) {
@@ -465,7 +463,8 @@ auth.post("/user-access", async (req, res) => {
         { ...options, returnDocument: "after", projection: { googleSub: 0 } },
       );
       if (!savedUser) return 404;
-      if (!assigning) await sessions.deleteMany({ userId: targetUserId }, options);
+      if (["suspend", "decline"].includes(action))
+        await sessions.deleteMany({ userId: targetUserId }, options);
     } else {
       savedUser = {
         _id: targetUserId, googleSub: null, email, name: email, ...after,
@@ -485,8 +484,6 @@ auth.post("/user-access", async (req, res) => {
     const { googleSub, ...record } = savedUser;
     return record;
   }));
-  if (result === "reauthentication_required")
-    return res.status(403).json({ code: result });
   if (result === "invalid_client_assignment")
     return res.status(400).json({ code: result, message: "A selected client no longer exists. Refresh the page and select an available client." });
   if (typeof result === "number") return res.sendStatus(result);
