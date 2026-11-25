@@ -2,6 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import express from "express";
 import { OAuth2Client } from "google-auth-library";
 import { MongoClient, ObjectId } from "mongodb";
+import { registerPilotRoutes } from "./pilot-routes.js";
+import { registerWorkflowRoutes } from "./workflow-routes.js";
 
 const { MONGODB_URI, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, APP_ORIGIN, PLATFORM_ADMIN_EMAIL } = process.env;
 const initOnly = process.argv.includes("--init-db");
@@ -490,6 +492,9 @@ auth.post("/user-access", async (req, res) => {
   if (typeof result === "number") return res.sendStatus(result);
   res.json({ message: "Access updated.", data: { users: [result] } });
 });
+
+registerPilotRoutes(auth, { db, mongo, current, isPlatformAdmin, hasClientRole });
+registerWorkflowRoutes(auth, { db, current, isPlatformAdmin, hasClientRole });
 
 app.use((error, req, res, next) => {
   console.error("Auth request failed", error.code ?? error.name);
