@@ -270,6 +270,28 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     res.json({ knowledgeVersions });
   });
 
+  router.post(projectPath + "/runs/drafts", projectScope, async (req, res) => {
+    const { scope, user, project, brand } = res.locals.workflow;
+    if (!hasClientRole(user, String(scope.clientId), ["marketing_operator", "approver"]))
+      return res.sendStatus(403);
+    if (project.status !== "active" || brand?.status !== "active")
+      return res.status(409).json({ message: "Select an active brand and project." });
+    const briefId = objectId(req.body?.briefId);
+    const briefVersion = req.body?.briefVersion;
+    if (!briefId || !Number.isSafeInteger(briefVersion) || briefVersion < 1)
+      return res.status(400).json({ message: "Save the brief before creating a draft." });
+    const brief = await db.collection("briefs").findOne({ ...scope, _id: briefId,
+      versions: { $elemMatch: { version: briefVersion } } });
+    if (!brief) return res.status(404).json({ message: "The saved brief version is unavailable." });
+    const version = brief.versions.find((entry) => entry.version === briefVersion);
+    const filter = { ...scope, briefId, briefVersion, ownerUserId: user._id, status: "draft" };
+    const run = await runs.findOneAndUpdate(filter, { $setOnInsert: {
+      title: brief.title, period: version.period, createdAt: new Date(),
+      ...(brief.agentId ? { agentId: brief.agentId } : {}),
+    } }, { upsert: true, returnDocument: "after" });
+    return res.status(201).json({ run });
+  });
+
   router.post(projectPath + "/briefs", projectScope, async (req, res) => {
     const { scope, user, project } = res.locals.workflow;
     if (!hasClientRole(user, String(scope.clientId), ["marketing_operator", "approver"]))
