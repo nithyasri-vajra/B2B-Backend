@@ -1,9 +1,19 @@
+import { createHash } from "node:crypto";
+import express from "express";
 import { ObjectId } from "mongodb";
 
 export const parseId = (value) => typeof value === "string" && /^[a-f0-9]{24}$/i.test(value)
   ? new ObjectId(value) : null;
 export const cleanText = (value) => typeof value === "string" ? value.trim() : "";
 export const idFilter = (id) => ({ $in: [id, String(id)] });
+
+const knowledgeAreas = new Map([
+  ["brand.md", ["D1", "D3"]],
+  ["claims.md", ["D2"]],
+  ["market.md", ["D6"]],
+  ["operations.md", ["D4", "D5", "D7"]],
+  ["learning.md", ["D8"]],
+]);
 
 export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmin, hasClientRole }) {
   const brands = db.collection("brands");
@@ -20,6 +30,7 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   async function scope(req, res, next) {
     const { user } = await current(req);
     if (!user) return res.sendStatus(401);
+    if (user.status !== "active") return res.sendStatus(403);
     const clientId = parseId(req.params.clientId);
     if (!clientId) return res.sendStatus(400);
     const brand = await brands.findOne({ _id: clientId });
@@ -97,6 +108,55 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
     const known = new Set(active.map(({ _id }) => String(_id)));
     res.json({ knowledgeSources: [...active, ...legacy.filter(({ _id }) => !known.has(String(_id)))
       .map(({ area, ...source }) => ({ ...source, areas: source.areas ?? (area ? [area] : []) }))] });
+  });
+
+  router.post(brandPath + "/knowledge/files/:filename", scope, (req, res, next) => {
+    const { admin, role, brand } = res.locals.brandScope;
+    if (!admin && !role("knowledge_admin")) return res.sendStatus(403);
+    if (brand.status === "archived") return res.sendStatus(409);
+    if (!knowledgeAreas.has(req.params.filename) || !req.is("application/octet-stream"))
+      return res.status(400).json({ message: "Choose one of the five knowledge Markdown files." });
+    next();
+  }, express.raw({ type: "application/octet-stream", limit: "1mb" }), async (req, res) => {
+    const { filename } = req.params;
+    const { user, clientId } = res.locals.brandScope;
+    if (!Buffer.isBuffer(req.body))
+      return res.status(400).json({ message: "Choose a non-empty Markdown file." });
+    let markdown;
+    try {
+      markdown = new TextDecoder("utf-8", { fatal: true }).decode(req.body);
+    } catch {
+      return res.status(400).json({ message: "Save this Markdown file as UTF-8." });
+    }
+    if (!markdown.trim() || markdown.includes("\0"))
+      return res.status(400).json({ message: "Choose a non-empty Markdown text file." });
+
+    const digest = createHash("sha256").update(req.body).digest("hex");
+    const key = createHash("sha256").update(String(clientId) + "/" + filename + "/" + digest).digest("hex");
+    const _id = new ObjectId(key.slice(0, 24));
+    const files = db.collection("knowledgeFiles");
+    const now = new Date();
+    const source = {
+      _id, clientId, sourceType: "file", title: filename, areas: knowledgeAreas.get(filename),
+      fileRef: "knowledgeFiles/" + _id, storedFile: true, processingStatus: "pending",
+      uploadedByUserId: user._id, createdAt: now, updatedAt: now,
+    };
+    try {
+      const saved = await mongo.withSession((session) => session.withTransaction(async () => {
+        const existing = await sources.findOne({ _id, clientId }, { session });
+        if (existing) return existing;
+        await files.insertOne({ _id, clientId, filename, digest, bytes: req.body, createdAt: now }, { session });
+        await sources.insertOne(source, { session });
+        await audit(user, clientId, "knowledge_source_added", _id, { filename }, session);
+        return source;
+      }));
+      res.json({ source: saved });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+      const existing = await sources.findOne({ _id, clientId, fileRef: source.fileRef });
+      if (!existing) throw error;
+      res.json({ source: existing });
+    }
   });
 
   router.post(brandPath + "/knowledge/sources", scope, async (req, res) => {

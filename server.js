@@ -384,8 +384,10 @@ auth.get("/audit", async (req, res) => {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647)
     return res.sendStatus(400);
   const pageSize = 250;
-  const ids = platformAdmin ? [] : clientIdentifiers(clientId);
-  const clientScope = platformAdmin ? [] : [{
+  if (clientId !== undefined && (typeof clientId !== "string" || !clientId.trim())) return res.sendStatus(400);
+  const globalAudit = platformAdmin && clientId === undefined;
+  const ids = globalAudit ? [] : clientIdentifiers(clientId);
+  const clientScope = globalAudit ? [] : [{
     $match: { $or: [
       { clientId: { $in: ids } },
       { "details.before.clientAssignments.clientId": { $in: ids } },
@@ -408,11 +410,14 @@ auth.get("/audit", async (req, res) => {
     { $lookup: { from: "users", localField: "targetUserId", foreignField: "_id", as: "target" } },
     { $project: {
       occurredAt: 1, eventType: 1, outcome: 1,
-      ...(platformAdmin ? { clientId: 1, ip: 1, device: 1 } : { clientId: { $literal: clientId } }),
+      ...(globalAudit ? { clientId: 1, ip: 1, device: 1 } : { clientId: { $literal: clientId } }),
       actor: { $arrayElemAt: ["$actor.email", 0] },
       target: { $arrayElemAt: ["$target.email", 0] },
-      ...(platformAdmin ? { "details.before": 1, "details.after": 1 } : {
-        details: { before: scopedAssignments("before"), after: scopedAssignments("after") },
+      ...(globalAudit ? { "details.before": 1, "details.after": 1 } : {
+        details: { $cond: [
+          { $and: [platformAdmin, { $in: ["$clientId", ids] }] }, "$details",
+          { before: scopedAssignments("before"), after: scopedAssignments("after") },
+        ] },
       }),
     } },
   ]).toArray();
@@ -542,6 +547,6 @@ app.use((error, req, res, next) => {
   if (error.code === 121)
     return res.status(422).json({ message: "The record does not match the database schema." });
   const status = error.code === 11000 ? 409 : error.status === 400 || error.status === 413 ? error.status : 500;
-  res.status(status).json({ message: "Could not complete the authentication request." });
+  res.status(status).json({ message: status === 413 ? "The file or request is too large." : "Could not complete the request." });
 });
 app.listen(Number(process.env.PORT ?? 3001), process.env.BIND_HOST ?? "127.0.0.1", () => console.log("B2B auth API ready."));

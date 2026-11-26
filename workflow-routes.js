@@ -1,5 +1,6 @@
 import { ObjectId } from "mongodb";
-import { parseId, cleanText } from "./brand-routes.js";
+import { callSkill } from "./qualification-skills.js";
+import { parseId, cleanText, idFilter } from "./brand-routes.js";
 
 const clientRoles = ["knowledge_admin", "marketing_operator", "approver", "viewer"];
 const objectId = parseId;
@@ -277,7 +278,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     if (project.status !== "active" || res.locals.workflow.brand?.status === "archived")
       return res.status(409).json({ message: "This project is inactive." });
     const { title, briefId, currentVersion, period, objective, audience, deliverables, kpi,
-      agentId: agentKey, fileRef, templateVersion, keyDates, blackoutDays, postingSlots } = req.body ?? {};
+      agentId: agentKey, fileRef, templateVersion, keyDates, blackoutDays, postingSlots, excelFields } = req.body ?? {};
     if (!cleanText(title) || !cleanText(period) || !cleanText(objective) || !cleanText(audience) ||
         deliverables == null || kpi == null)
       return res.status(400).json({ message: "Complete the brief title, period, objective, audience, deliverables and KPI." });
@@ -291,6 +292,14 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     }
     const version = { period, objective, audience, deliverables, kpi,
       savedBy: user._id, savedAt: new Date() };
+    if (excelFields !== undefined) {
+      if (!excelFields || typeof excelFields !== "object" || Array.isArray(excelFields) ||
+          Object.entries(excelFields).some(([key, value]) => !cleanText(key) ||
+            !["string", "number", "boolean"].includes(typeof value)) ||
+          !Number.isInteger(deliverables) || deliverables < 1 || deliverables > 40 || !cleanText(kpi))
+        return res.status(400).json({ message: "Provide valid Excel fields, a post count from 1 to 40 and a primary KPI." });
+      version.excelFields = excelFields;
+    }
     for (const [key, value] of Object.entries({ fileRef, templateVersion })) {
       if (value === undefined) continue;
       if (!cleanText(value)) return res.sendStatus(400);
@@ -325,6 +334,109 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     }, { returnDocument: "after" });
     if (!brief) return res.status(409).json({ message: "The brief changed. Reload it before saving again." });
     res.json({ brief });
+  });
+
+  router.post(projectPath + "/runs", projectScope, async (req, res) => {
+    const { user, scope, brand, project } = res.locals.workflow;
+    if (!hasClientRole(user, String(scope.clientId), ["marketing_operator", "approver"]))
+      return res.sendStatus(403);
+    if (project.status !== "active" || !brand || brand.status === "archived")
+      return res.status(409).json({ message: "This project is inactive." });
+    const briefId = objectId(req.body?.briefId);
+    const currentVersion = req.body?.currentVersion;
+    if (!briefId || !Number.isSafeInteger(currentVersion) || currentVersion < 1) return res.sendStatus(400);
+    const brief = await db.collection("briefs").findOne({ ...scope, _id: briefId });
+    if (!brief) return res.sendStatus(404);
+    if (brief.currentVersion !== currentVersion)
+      return res.status(409).json({ message: "The brief changed. Validate the latest revision before starting." });
+    const version = brief.versions?.find((entry) => entry.version === currentVersion);
+    if (!version?.excelFields && !version?.validated)
+      return res.status(422).json({ message: "Upload and validate an Excel brief before starting." });
+
+    const config = {
+      key: process.env.OPENAI_API_KEY, model: process.env.OPENAI_MODEL,
+      "context-assembler": { id: process.env.B2B_CONTEXT_SKILL_ID, version: process.env.B2B_CONTEXT_SKILL_VERSION },
+      "brief-qualifier": { id: process.env.B2B_QUALIFIER_SKILL_ID, version: process.env.B2B_QUALIFIER_SKILL_VERSION },
+    };
+    if (!config.key || !config.model || !["context-assembler", "brief-qualifier"].every(
+      (stage) => config[stage].id && config[stage].version,
+    )) return res.status(503).json({ message: "Configure both qualification skills on the backend before starting a run." });
+
+    const knowledgeVersions = db.collection("knowledgeVersions");
+    const [projectKnowledge, published] = await Promise.all([
+      knowledgeVersions.find({ ...scope, status: { $in: ["approved", "published"] } })
+        .sort({ version: -1 }).toArray(),
+      brand.publishedKnowledgeVersionId && knowledgeVersions.findOne({
+        _id: brand.publishedKnowledgeVersionId, clientId: idFilter(brand._id), status: "published",
+      }),
+    ]);
+    const approved = new Map();
+    for (const entry of projectKnowledge) {
+      const key = entry.recordKey ?? String(entry._id);
+      if (!approved.has(key)) approved.set(key, { recordKey: entry.recordKey, version: entry.version, data: entry.data });
+    }
+    const ids = published?.recordRevisions ?? [];
+    const records = ids.length ? await db.collection("knowledgeRecords")
+      .find({ clientId: brand._id, _id: { $in: ids.map(({ recordId }) => recordId) } }).toArray() : [];
+    const knowledge = [...approved.values(), ...records.flatMap((record) => {
+      const pinned = ids.find(({ recordId }) => String(recordId) === String(record._id));
+      const revision = record.revisions?.find((entry) => entry.revision === pinned?.revision);
+      return revision ? [{ area: record.area, recordType: record.recordType, ...revision }] : [];
+    })];
+
+    const stages = db.collection("stageExecutions");
+    const record = {
+      ...scope, _id: new ObjectId(), title: brief.title, period: version.period,
+      ...(brief.agentId ? { agentId: brief.agentId } : {}),
+      briefId, briefVersion: currentVersion, ownerUserId: user._id, ownerEmail: user.email,
+      ...(published && { knowledgeVersionId: published._id }),
+      projectKnowledgeVersionIds: projectKnowledge.map(({ _id }) => _id),
+      status: "running", currentStageKey: "brief-qualifier", startedAt: new Date(),
+    };
+    await mongo.withSession((session) => session.withTransaction(async () => {
+      await runs.insertOne(record, { session });
+      await writeAudit(scope, user, "run_started", "run", record._id, { briefId, currentVersion }, session);
+    }));
+
+    const qualificationResult = {};
+    const stageExecutions = [];
+    const signal = AbortSignal.timeout(650_000);
+    const persistStage = async (stageKey, input) => {
+      const startedAt = new Date();
+      const result = await callSkill(config, stageKey, input, signal);
+      const entry = { ...scope, runId: record._id, stageKey, attempt: 1, status: "completed",
+        startedAt, finishedAt: new Date(), verdict: result.verdict, output: result.report,
+        openAIResponseId: result.responseId };
+      await stages.insertOne(entry);
+      stageExecutions.push(entry);
+      return result;
+    };
+    try {
+      const fields = version.excelFields ?? version.fields;
+      const channel = Object.entries(fields ?? {}).find(([key]) => key.toLowerCase() === "channel")?.[1];
+      const input = { client: brand.name, channel, knowledgeVersion: published?.version,
+        brief: { fields, period: version.period, postCount: version.deliverables ?? version.postCount,
+          objective: version.objective, audience: version.audience, kpi: version.kpi } };
+      const context = await persistStage("context-assembler", { ...input, knowledge, stage: "Brief Qualifier" });
+      qualificationResult.context = context;
+      if (context.verdict !== "BLOCKED") {
+        qualificationResult.qualification = await persistStage("brief-qualifier", {
+          ...input, context: context.report, contextVerdict: context.verdict,
+        });
+        if (context.verdict === "LIMITED" && qualificationResult.qualification.verdict === "READY")
+          qualificationResult.qualification.verdict = "LIMITED";
+      }
+    } catch (error) {
+      console.error("Run qualification failed", error.code ?? error.name);
+      qualificationResult.error = signal.aborted ? "Qualification timed out." : "A qualification stage failed.";
+    }
+    const verdict = qualificationResult.qualification?.verdict ?? qualificationResult.context?.verdict;
+    const update = { qualificationResult, finishedAt: new Date() };
+    const saved = await runs.findOneAndUpdate({ ...scope, _id: record._id, status: "running" }, {
+      $set: { ...update, status: qualificationResult.error ? "failed" : verdict === "BLOCKED" ? "blocked" : "qualified" },
+    }, { returnDocument: "after" });
+    if (!saved) await runs.updateOne({ ...scope, _id: record._id }, { $set: { qualificationResult } });
+    res.status(201).json({ record: saved ?? await runs.findOne({ ...scope, _id: record._id }), stageExecutions });
   });
 
   for (const [path, parentCollection] of [
