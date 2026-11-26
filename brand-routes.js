@@ -1,4 +1,12 @@
-import { ObjectId } from "mongodb";
+import { extname } from "node:path";
+import { finished } from "node:stream/promises";
+import { raw } from "express";
+import { GridFSBucket, ObjectId } from "mongodb";
+
+const maxKnowledgeFileBytes = 2 * 1024 * 1024;
+const knowledgeFileTypes = new Set([
+  ".md", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt", ".vtt", ".png", ".jpg", ".jpeg", ".webp", ".gif",
+]);
 
 export const parseId = (value) => typeof value === "string" && /^[a-f0-9]{24}$/i.test(value)
   ? new ObjectId(value) : null;
@@ -121,6 +129,91 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
       await audit(user, clientId, "knowledge_source_added", source._id, {}, session);
     }));
     res.status(201).json({ source });
+  });
+
+  const readUpload = raw({ type: "multipart/form-data", limit: maxKnowledgeFileBytes + 64 * 1024 });
+  router.post(brandPath + "/knowledge/sources/upload", scope, (req, res, next) => {
+    const { role, admin, brand } = res.locals.brandScope;
+    if (!admin && !role("knowledge_admin")) return res.sendStatus(403);
+    if (brand.status === "archived") return res.sendStatus(409);
+    if (!req.is("multipart/form-data"))
+      return res.status(415).json({ message: "Send the file as multipart form data." });
+    readUpload(req, res, (error) => {
+      if (error?.status === 413)
+        return res.status(413).json({ message: "Choose a knowledge file no larger than 2 MiB." });
+      next(error);
+    });
+  }, async (req, res) => {
+    const { user, clientId } = res.locals.brandScope;
+    let form;
+    try {
+      form = await new Response(req.body, {
+        headers: { "Content-Type": req.get("content-type") },
+      }).formData();
+    } catch {
+      return res.status(400).json({ message: "Could not read the upload. Choose one file and try again." });
+    }
+    const file = form.get("file");
+    const fileCount = [...form.values()].filter((value) => typeof value !== "string").length;
+    const areas = [...new Set(form.getAll("areas").map(cleanText).filter(Boolean))];
+    if (fileCount !== 1 || typeof file === "string" || !file?.size ||
+        !areas.length || areas.length > 20 || areas.some((area) => area.length > 100))
+      return res.status(400).json({ message: "Choose one non-empty file and at least one knowledge area." });
+    if (file.size > maxKnowledgeFileBytes)
+      return res.status(413).json({ message: "Choose a knowledge file no larger than 2 MiB." });
+    const title = file.name.trim();
+    const extension = extname(title).toLowerCase();
+    if (title.length > 255 || /[/\\\x00-\x1f]/.test(title) || !knowledgeFileTypes.has(extension))
+      return res.status(415).json({ message: "Choose a supported knowledge file." });
+
+    const bytes = Buffer.from(await file.arrayBuffer());
+    let statement;
+    if (extension === ".md") {
+      try {
+        statement = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
+      } catch {
+        return res.status(400).json({ message: "Save the Markdown file as UTF-8 and try again." });
+      }
+      if (!statement || statement.includes("\0"))
+        return res.status(400).json({ message: "Add readable text to the Markdown file." });
+    }
+
+    const now = new Date();
+    const fileId = new ObjectId();
+    const source = {
+      _id: new ObjectId(), clientId, sourceType: "file", title, areas,
+      fileRef: String(fileId), processingStatus: statement ? "completed" : "pending",
+      uploadedByUserId: user._id, createdAt: now, updatedAt: now,
+    };
+    const record = statement ? {
+      _id: new ObjectId(), clientId, sourceId: source._id, area: areas[0], recordType: "document",
+      currentRevision: 1, revisions: [{ revision: 1, statement, agentKey: null, reviewStatus: "needs_review" }],
+      createdAt: now, updatedAt: now,
+    } : null;
+    const bucket = new GridFSBucket(db, { bucketName: "knowledgeFiles" });
+    try {
+      const upload = bucket.openUploadStreamWithId(fileId, title, { metadata: { clientId, sourceId: source._id } });
+      const uploaded = finished(upload);
+      upload.end(bytes);
+      await uploaded;
+      await mongo.withSession((session) => session.withTransaction(async () => {
+        await sources.insertOne(source, { session });
+        if (record) await records.insertOne(record, { session });
+        await audit(user, clientId, "knowledge_source_added", source._id, {}, session);
+        if (record) await audit(user, clientId, "knowledge_record_created", record._id, {}, session);
+      }));
+    } catch (error) {
+      // An uncertain commit could still reference the file.
+      if (!error.hasErrorLabel?.("UnknownTransactionCommitResult")) {
+        try { await bucket.delete(fileId); }
+        catch (cleanupError) {
+          if (cleanupError.code !== "ENOENT" && !cleanupError.message?.startsWith("File not found"))
+            console.error("Knowledge upload cleanup failed", cleanupError.name);
+        }
+      }
+      throw error;
+    }
+    res.status(201).json({ source, record });
   });
 
   router.get(brandPath + "/knowledge/records", scope, async (req, res) => {
