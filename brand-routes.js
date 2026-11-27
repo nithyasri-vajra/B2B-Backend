@@ -21,6 +21,72 @@ const knowledgeAreas = new Map([
   ["operations.md", ["D4", "D5", "D7"]],
   ["learning.md", ["D8"]],
 ]);
+const claimPermission = (value) => cleanText(value).toLowerCase().replace(/[\s-]+/g, "_");
+const claimPermissions = new Set(["public", "restricted", "internal_only"]);
+const isClaim = ({ area, recordType }) => /^claims?$/i.test(cleanText(area)) ||
+  /\bclaims?\b/i.test(cleanText(recordType).replace(/_/g, " "));
+
+function canReuseClaim(revision, now) {
+  return revision?.reviewStatus === "approved" &&
+    ["A", "B", "C"].includes(revision.evidenceGrade) &&
+    Boolean(cleanText(revision.sourceReference)) &&
+    claimPermission(revision.usagePermission) === "public" &&
+    (revision.reviewDueAt == null || new Date(revision.reviewDueAt) > now);
+}
+
+export async function resolvePublishedKnowledge(db, brand, {
+  versionId = brand?.publishedKnowledgeVersionId, session, now = new Date(),
+} = {}) {
+  const id = parseId(String(versionId));
+  if (!brand || !id) return { version: null, records: [], missing: false };
+  const version = await db.collection("knowledgeVersions").findOne({
+    _id: id, clientId: idFilter(brand._id), status: "published",
+  }, { session });
+  const refs = version?.recordRevisions ?? [];
+  if (!refs.length) return { version, records: [], missing: false };
+  const rows = await db.collection("knowledgeRecords").find({
+    clientId: idFilter(brand._id), _id: { $in: refs.map(({ recordId }) => parseId(String(recordId))).filter(Boolean) },
+  }, { session }).toArray();
+  const byId = new Map(rows.map((row) => [String(row._id), row]));
+  const records = [];
+  for (const { recordId, revision } of refs) {
+    const row = byId.get(String(recordId));
+    const entry = row?.revisions?.find((value) => value.revision === revision && value.reviewStatus === "approved");
+    if (!entry) continue;
+    const current = row.currentRevision == null ? entry :
+      row.revisions.find((value) => value.revision === row.currentRevision);
+    const excluded = isClaim(row) && (!canReuseClaim(entry, now) ||
+      claimPermission(current?.usagePermission) !== "public" ||
+      ["disputed", "expired", "rejected"].includes(current?.reviewStatus));
+    records.push({ excluded,
+      expired: entry.reviewDueAt != null && !(new Date(entry.reviewDueAt) > now),
+      data: { ...entry, recordId: row._id, area: row.area, recordType: row.recordType },
+    });
+  }
+  return { version, records, missing: records.length !== refs.length };
+}
+
+export function assessReadiness(snapshot, { agentKey, brief, requireBrief = false } = {}) {
+  const applicable = snapshot.records.filter(({ data }) => !data.agentKey || data.agentKey === agentKey);
+  const knowledge = applicable.filter(({ expired, excluded }) => !expired && !excluded).map(({ data }) => data);
+  const reason = requireBrief && brief?.validated !== true ? "Save a validated Excel brief before starting the run."
+    : !snapshot.version ? "Publish the brand's knowledge before starting the run."
+    : snapshot.missing ? "A published knowledge revision is unavailable."
+    : !knowledge.length ? "No current published knowledge applies to this scope."
+    : applicable.some(({ excluded }) => excluded) ? "Published claims without current permission or evidence were excluded."
+    : knowledge.length < applicable.length ? "Some published knowledge has expired and was excluded." : null;
+  const blocked = (requireBrief && brief?.validated !== true) || !snapshot.version || snapshot.missing || !knowledge.length;
+  const verdict = blocked ? "BLOCKED" : reason ? "LIMITED" : "READY";
+  return { knowledge, readiness: { verdict, band: verdict, blocked, canStart: !blocked, reason,
+    limitations: verdict === "LIMITED" ? [reason] : [] } };
+}
+
+export function mergeReadiness(readiness, verdict, reason) {
+  if (readiness.blocked || !["LIMITED", "BLOCKED"].includes(verdict) || readiness.verdict === verdict) return readiness;
+  const blocked = verdict === "BLOCKED";
+  return { verdict, band: verdict, blocked, canStart: !blocked, reason,
+    limitations: blocked ? [] : [reason] };
+}
 
 export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmin, hasClientRole }) {
   const brands = db.collection("brands");
@@ -98,11 +164,16 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   });
 
   router.get(brandPath + "/knowledge/readiness", scope, async (req, res) => {
-    const { brand, clientId } = res.locals.brandScope;
-    const version = brand.publishedKnowledgeVersionId && await versions.findOne({
-      _id: brand.publishedKnowledgeVersionId, clientId: idFilter(clientId), status: "published",
-    }, { projection: { readiness: 1, version: 1 } });
-    res.json({ readiness: version?.readiness ?? null, version: version?.version ?? null });
+    const { brand } = res.locals.brandScope;
+    const snapshot = await resolvePublishedKnowledge(db, brand);
+    const { readiness } = assessReadiness(snapshot);
+    const keys = (brand.agents ?? []).filter(({ enabled }) => enabled === true).map(({ agentKey }) => agentKey);
+    const live = keys.length ? await agents.find({ agentKey: { $in: keys }, releaseStatus: "live" })
+      .project({ agentKey: 1 }).toArray() : [];
+    const perAgent = Object.fromEntries(live.map(({ agentKey }) => [
+      agentKey, assessReadiness(snapshot, { agentKey }).readiness,
+    ]));
+    res.json({ readiness: { ...readiness, perAgent }, version: snapshot.version?.version ?? null });
   });
 
   router.get(brandPath + "/knowledge/sources", scope, async (req, res) => {
@@ -335,6 +406,12 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
     }
     if (changes.evidenceGrade && !["A", "B", "C", "D"].includes(changes.evidenceGrade))
       return res.sendStatus(400);
+    if (isClaim(existing) && Object.hasOwn(changes, "usagePermission")) {
+      const permission = claimPermission(changes.usagePermission);
+      if (permission && !claimPermissions.has(permission))
+        return res.status(422).json({ message: "Use Public, Restricted or Internal only for claim reuse permission." });
+      changes.usagePermission = permission;
+    }
     if (Object.hasOwn(changes, "statement") && !changes.statement) return res.sendStatus(400);
     if (Object.hasOwn(req.body, "reviewDueAt")) {
       const value = req.body.reviewDueAt;
@@ -364,13 +441,13 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
     const now = new Date();
     const published = await mongo.withSession((session) => session.withTransaction(async () => {
       const versionId = new ObjectId();
-      const approvedRecords = await records.aggregate([
+      const approvedRecords = (await records.aggregate([
         { $match: { clientId } }, { $unwind: "$revisions" },
         { $match: { $expr: { $eq: ["$currentRevision", "$revisions.revision"] },
           "revisions.reviewStatus": "approved", "revisions.evidenceGrade": { $in: ["A", "B", "C"] },
           $or: [{ "revisions.reviewDueAt": null }, { "revisions.reviewDueAt": { $gt: now } }] } },
-        { $project: { revision: "$currentRevision" } },
-      ], { session }).toArray();
+        { $project: { revision: "$currentRevision", area: 1, recordType: 1, data: "$revisions" } },
+      ], { session }).toArray()).filter((record) => !isClaim(record) || canReuseClaim(record.data, now));
       if (!approvedRecords.length) return null;
       const lock = await brands.updateOne({
         _id: clientId, status: { $ne: "archived" },

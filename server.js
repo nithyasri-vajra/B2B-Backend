@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import express from "express";
 import { OAuth2Client } from "google-auth-library";
 import { MongoClient, ObjectId } from "mongodb";
@@ -28,11 +28,13 @@ try {
 const db = mongo.db(process.env.MONGODB_DB || "social_content_dev");
 const users = db.collection("users");
 const sessions = db.collection("sessions");
+const oauthAttempts = db.collection("oauth_attempts");
 const audits = db.collection("audit_events");
 await users.createIndex({ googleSub: 1 }, { unique: true, partialFilterExpression: { googleSub: { $type: "string" } } });
 await users.createIndex({ email: 1 }, { unique: true });
 await sessions.createIndex({ tokenHash: 1 }, { unique: true });
 await sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+await oauthAttempts.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 if (!(await db.listCollections({ name: "audit_events" }, { nameOnly: true }).hasNext())) {
   try {
     await db.createCollection("audit_events");
@@ -60,7 +62,6 @@ auth.use((req, res, next) => {
     return res.sendStatus(403);
   next();
 });
-const attempts = new Map();
 const token = () => randomBytes(32).toString("base64url");
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const cookieOptions = { httpOnly: true, sameSite: "lax", secure, path };
@@ -110,18 +111,13 @@ async function current(req) {
 
 auth.post("/sign-in", async (req, res) => {
   const now = Date.now();
-  for (const [key, attempt] of attempts) {
-    if (attempt.expires <= now) attempts.delete(key);
-  }
-  if (attempts.size >= 1000) return res.sendStatus(503);
+  if (await oauthAttempts.countDocuments({ expiresAt: { $gt: new Date(now) } }, { limit: 1000 }) >= 1000)
+    return res.sendStatus(503);
   const state = token();
   const nonce = token();
   const verifier = token();
   const { user, session } = req.body?.reauthenticate === true ? await current(req) : {};
   if (req.body?.reauthenticate === true && (user?.status !== "active" || !hasRole(user))) return res.sendStatus(403);
-  attempts.set(state, { nonce, verifier, userId: user?._id, sessionId: session?._id, startedAt: now, expires: now + stepUpMs });
-  res.cookie("b2b_oauth", state, { ...cookieOptions, maxAge: 300000 });
-  res.clearCookie("b2b_denied", cookieOptions);
   const url = new URL(google.generateAuthUrl({
     scope: ["openid", "email", "profile"],
     state,
@@ -135,18 +131,24 @@ auth.post("/sign-in", async (req, res) => {
     url.searchParams.set("max_age", "0");
     url.searchParams.set("claims", JSON.stringify({ id_token: { auth_time: { essential: true } } }));
   }
+  await oauthAttempts.insertOne({
+    _id: hash(state), nonce, verifier, startedAt: now, expiresAt: new Date(now + stepUpMs),
+    ...(user ? { userId: user._id, sessionId: session._id } : {}),
+  });
+  res.cookie("b2b_oauth", state, { ...cookieOptions, maxAge: stepUpMs });
+  res.clearCookie("b2b_denied", cookieOptions);
   res.json({ redirectUrl: url.href });
 });
 
 auth.get("/callback", async (req, res) => {
   const { state, code } = req.query;
   const attempt = typeof state === "string" && state === cookie(req, "b2b_oauth")
-    ? attempts.get(state) : undefined;
-  if (!attempt || attempt.expires <= Date.now()) {
+    ? await oauthAttempts.findOneAndDelete({ _id: hash(state), expiresAt: { $gt: new Date() } })
+    : null;
+  if (!attempt) {
     await audit("sign_in", "denied", null, null, { reason: "invalid_oauth_state" });
     return res.sendStatus(400);
   }
-  attempts.delete(state);
   res.clearCookie("b2b_oauth", cookieOptions);
   const deny = async (reason = "1") => {
     await audit("sign_in", "denied");
@@ -538,15 +540,66 @@ registerPilotRoutes(auth, { db, mongo, current, isPlatformAdmin, hasClientRole }
 registerWorkflowRoutes(auth, { db, mongo, current, isPlatformAdmin, hasClientRole, recentStepUp });
 registerBrandRoutes(auth, { db, mongo, current, isPlatformAdmin, hasClientRole });
 
+const workflowOperations = [
+  [/^\/clients$/, "brands", "load the brands", "create the brand"],
+  [/^\/workflow\/brands\/[^/]+$/, "brand", "load the brand", "save the brand settings"],
+  [/^\/workflow\/brands\/[^/]+\/knowledge\/readiness$/, "readiness", "load knowledge readiness"],
+  [/^\/workflow\/brands\/[^/]+\/knowledge\/sources\/upload$/, "knowledge_upload", null, "upload the knowledge file"],
+  [/^\/workflow\/brands\/[^/]+\/knowledge\/sources$/, "knowledge_sources", "load knowledge sources", "register the knowledge source"],
+  [/^\/workflow\/brands\/[^/]+\/knowledge\/records\/[^/]+\/revisions$/, "knowledge_revision", null, "save the knowledge revision"],
+  [/^\/workflow\/brands\/[^/]+\/knowledge\/records$/, "knowledge_records", "load knowledge records", "create the knowledge record"],
+  [/^\/workflow\/brands\/[^/]+\/knowledge\/versions$/, "knowledge_publication", null, "publish the knowledge version"],
+  [/^\/workflow\/agents$/, "agents", "load the agents"],
+  [/^\/workflow\/approvals$/, "approvals", "load approvals"],
+  [/^\/workflow\/clients\/[^/]+\/projects$/, "projects", "load the projects"],
+  [/^\/workflow\/projects\/[^/]+\/knowledge$/, "project_knowledge", "load project knowledge"],
+  [/^\/workflow\/projects\/[^/]+\/briefs$/, "briefs", "load the briefs", "save the brief"],
+  [/^\/workflow\/projects\/[^/]+\/runs\/drafts$/, "run_draft", null, "save the run draft"],
+  [/^\/workflow\/projects\/[^/]+\/runs\/[^/]+\/cancel$/, "run_cancel", null, "cancel the run"],
+  [/^\/workflow\/projects\/[^/]+\/runs\/[^/]+\/plan-review$/, "plan_review", null, "request plan review"],
+  [/^\/workflow\/projects\/[^/]+\/runs(?:\/[^/]+)?$/, "runs", "load run information", "start the run"],
+  [/^\/workflow\/projects\/[^/]+\/reviews\/[^/]+\/decision$/, "review_decision", null, "save the review decision"],
+  [/^\/workflow\/projects\/[^/]+\/posts\/[^/]+\/drafts$/, "post_draft", null, "save the post draft"],
+  [/^\/workflow\/projects\/[^/]+\/posts\/[^/]+\/gate-2-review$/, "output_review", null, "request Gate 2 review"],
+  [/^\/workflow\/projects\/[^/]+\/posts(?:\/[^/]+)?$/, "posts", "load post information"],
+  [/^\/run-context$/, "context_submit", null, "queue the context job"],
+  [/^\/run-context\/[^/]+\/retry$/, "context_retry", null, "retry the context job"],
+  [/^\/run-context\/[^/]+$/, "context_status", "load the context job status"],
+];
+
 app.use((error, req, res, next) => {
-  console.error("Auth request failed", error.code ?? error.name);
-  if (req.method === "POST" && req.originalUrl === path + "/user-access" && error.code === 121)
+  const requestId = randomUUID();
+  const route = req.originalUrl.split("?", 1)[0].slice(path.length).replace(/\/$/, "");
+  const read = req.method === "GET" || req.method === "HEAD";
+  const operation = workflowOperations.find(([pattern]) => pattern.test(route)) ??
+    (route.startsWith("/workflow/") ? [null, "workflow", "load workflow information", "complete the workflow action"] : null);
+  const action = operation?.[read ? 2 : 3];
+  const operationCode = action ? (read ? "read_" : "write_") + operation[1] : "authentication";
+  const status = error.code === 121 ? 422 : error.code === 11000 ? 409 :
+    [400, 413].includes(error.status) ? error.status : 500;
+  console.error("API request failed", { requestId, operation: operationCode, status, error: error.code ?? error.name });
+  if (res.headersSent) return next(error);
+  res.set("X-Request-Id", requestId);
+
+  if (action) {
+    const retryable = status >= 500 || status === 409;
+    const retryGuidance = status >= 500 ? (read ? "Try again shortly." :
+      "Refresh and check whether the change was saved before retrying.")
+      : status === 409 ? "Refresh the record and try again."
+      : status === 413 ? "Choose a smaller file before retrying."
+      : "Correct the submitted information before retrying.";
+    const reason = { 400: "invalid_request", 409: "conflict", 413: "too_large", 422: "validation_failed" }[status] ?? "failed";
+    return res.status(status).json({
+      code: operationCode + "_" + reason, message: "Could not " + action + ". " + retryGuidance,
+      retryable, retryGuidance, requestId,
+    });
+  }
+  if (req.method === "POST" && route === "/user-access" && error.code === 121)
     return res.status(422).json({ message: error.accessAuditValidationFailed
       ? "MongoDB rejected the audit record. The role change was rolled back."
       : "MongoDB rejected the user update because it does not match the users collection schema." });
   if (error.code === 121)
     return res.status(422).json({ message: "The record does not match the database schema." });
-  const status = error.code === 11000 ? 409 : error.status === 400 || error.status === 413 ? error.status : 500;
   res.status(status).json({ message: status === 413 ? "The file or request is too large." : "Could not complete the request." });
 });
 app.listen(Number(process.env.PORT ?? 3001), process.env.BIND_HOST ?? "127.0.0.1", () => console.log("B2B auth API ready."));
