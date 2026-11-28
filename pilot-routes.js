@@ -11,7 +11,7 @@ const validId = (id) => typeof id === "string" && /^[a-f0-9]{24}$/i.test(id);
 const maxAttempts = 3;
 const claimDuration = 11 * 60_000;
 const stageKey = "context-assembler";
-const runRoles = ["marketing_operator", "approver"];
+const runRoles = ["operator", "approver"];
 
 export function registerPilotRoutes(router, { db, mongo, current, hasClientRole }) {
   const jobs = db.collection("contextJobs");
@@ -208,7 +208,7 @@ export function registerPilotRoutes(router, { db, mongo, current, hasClientRole 
       const project = await db.collection("projects").findOne({
         _id: new ObjectId(projectId), status: "active",
       });
-      if (!project || !hasClientRole(user, String(project.clientId), ["marketing_operator", "approver"]))
+      if (!project || !hasClientRole(user, String(project.clientId), ["operator", "approver"]))
         return res.sendStatus(403);
       const scope = { clientId: project.clientId, projectId: project._id };
       const brand = ObjectId.isValid(project.clientId) && await db.collection("brands").findOne({

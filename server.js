@@ -78,9 +78,9 @@ const signInDenialMessages = new Map([
   ["sign_in_failed", "Google sign-in couldn't be completed. Please try again."],
 ]);
 const roles = {
-  knowledge_admin: "Knowledge Admin",
+  brand_manager: "Brand Manager",
   approver: "Approver",
-  marketing_operator: "Marketing Operator",
+  operator: "Operator",
   viewer: "Viewer",
 };
 
@@ -343,7 +343,7 @@ auth.post("/clients", async (req, res) => {
   const saved = await mongo.withSession((session) => session.withTransaction(async () => {
     const manager = await users.updateOne({ _id: managerId, status: "active" }, {
       $push: { clientAssignments: {
-        clientId: String(brand._id), roles: ["knowledge_admin"], assignedByUserId: user._id, assignedAt: now,
+        clientId: String(brand._id), roles: ["brand_manager"], assignedByUserId: user._id, assignedAt: now,
       } }, $set: { updatedAt: now },
     }, { session });
     if (!manager.matchedCount) return false;
@@ -380,7 +380,7 @@ auth.get("/audit", async (req, res) => {
   const { user } = await current(req);
   const { clientId } = req.query;
   const platformAdmin = isPlatformAdmin(user);
-  if (!platformAdmin && !hasClientRole(user, clientId, ["knowledge_admin", "approver"]))
+  if (!platformAdmin && !hasClientRole(user, clientId, ["brand_manager", "approver", "viewer"]))
     return res.sendStatus(403);
   const offset = Number(req.query.offset ?? 0);
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647)

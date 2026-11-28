@@ -4,7 +4,7 @@ import { callSkill } from "./qualification-skills.js";
 import { parseId, cleanText, idFilter, assessReadiness, mergeReadiness, resolvePublishedKnowledge } from "./brand-routes.js";
 
 
-const clientRoles = ["knowledge_admin", "marketing_operator", "approver", "viewer"];
+const clientRoles = ["brand_manager", "operator", "approver", "viewer"];
 const objectId = parseId;
 const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
 const channelKey = (value) => normalize(value).replace(/^linkedin company page$/, "linkedin");
@@ -691,7 +691,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
   }
 
   function canReviewOwnPlan(user, scope, run) {
-    return ownsRun(user, run) && hasClientRole(user, String(scope.clientId), ["marketing_operator"]);
+    return ownsRun(user, run) && hasClientRole(user, String(scope.clientId), ["operator"]);
   }
 
   async function canDecideGate2(user, scope, run, session) {
@@ -724,7 +724,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     if (!user) return res.sendStatus(401);
     if (user.status !== "active") return res.sendStatus(403);
     const allowed = (user.clientAssignments ?? []).filter(({ clientId }) =>
-      hasClientRole(user, String(clientId), ["marketing_operator", "approver"]));
+      hasClientRole(user, String(clientId), ["operator", "approver"]));
     const ids = allowed.flatMap(({ clientId }) => [String(clientId), objectId(String(clientId))].filter(Boolean));
     const reviewDecisions = await decisions.find({
       clientId: { $in: ids }, assignedReviewerId: user._id, status: "pending",
@@ -750,7 +750,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     if (run.currentStageKey !== "gate_1" || plan?.version !== planVersion ||
       selected.some((id) => !plan.items?.some((item) => String(item.itemId) === id))) return res.sendStatus(409);
     const approvals = selfReview ? [{ reviewType: "owner", assignedReviewerId: user._id }] : [];
-    if (askApprover || !selfReview) {
+    if (!selfReview) {
       const ids = [brand?.defaultApproverUserId, brand?.backupApproverUserId]
         .map((id) => objectId(String(id))).filter((id) => id && !id.equals(user._id));
       const candidates = ids.length ? await db.collection("users").find({ _id: { $in: ids }, status: "active" }).toArray() : [];
@@ -913,7 +913,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
 
   router.post(projectPath + "/posts/:recordId/gate-2-review", projectScope, async (req, res) => {
     const { scope, user, brand, project } = res.locals.workflow;
-    if (!hasClientRole(user, String(scope.clientId), ["marketing_operator", "approver"])) return res.sendStatus(403);
+    if (!hasClientRole(user, String(scope.clientId), ["operator", "approver"])) return res.sendStatus(403);
     const contentItemId = objectId(req.params.recordId);
     const draftVersionId = objectId(req.body?.draftVersionId);
     const destination = channelKey(cleanText(req.body?.destination));
@@ -1093,7 +1093,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     const ids = [clientId, objectId(clientId)].filter(Boolean);
     const projects = await db.collection("projects").find({ clientId: { $in: ids } })
       .project({ name: 1, clientId: 1, channels: 1, status: 1 }).sort({ name: 1 }).toArray();
-    if (!hasClientRole(user, clientId, ["marketing_operator", "approver"])) return res.json({ projects });
+    if (!hasClientRole(user, clientId, ["operator", "approver"])) return res.json({ projects });
     const brand = await db.collection("brands").findOne({ _id: objectId(clientId) }, { projection: { agents: 1 } });
     const keys = (brand?.agents ?? []).filter(({ enabled }) => enabled === true).map(({ agentKey }) => agentKey);
     const agents = await db.collection("agents").find({ agentKey: { $in: keys }, releaseStatus: "live" })
@@ -1114,9 +1114,9 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
   router.get(projectPath + "/knowledge", projectScope, async (req, res) => {
     const { scope, user, brand } = res.locals.workflow;
     const clientId = String(scope.clientId);
-    if (!isPlatformAdmin(user) && !hasClientRole(user, clientId, clientRoles.slice(0, 3)))
+    if (!isPlatformAdmin(user) && !hasClientRole(user, clientId, clientRoles))
       return res.sendStatus(403);
-    const filter = isPlatformAdmin(user) || hasClientRole(user, clientId, ["knowledge_admin"])
+    const filter = isPlatformAdmin(user) || hasClientRole(user, clientId, ["brand_manager"])
       ? scope : { ...scope, status: { $in: ["approved", "published"] } };
     const knowledgeVersions = await db.collection("knowledgeVersions").find(filter)
       .sort({ _id: -1 }).toArray();
@@ -1134,7 +1134,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
 
   router.post(projectPath + "/runs/drafts", projectScope, async (req, res) => {
     const { scope, user, project, brand } = res.locals.workflow;
-    if (!hasClientRole(user, String(scope.clientId), ["marketing_operator", "approver"]))
+    if (!hasClientRole(user, String(scope.clientId), ["operator", "approver"]))
       return res.sendStatus(403);
     if (project.status !== "active" || brand?.status !== "active")
       return res.status(409).json({ message: "Select an active brand and project." });
@@ -1160,7 +1160,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
 
   router.post(projectPath + "/runs", projectScope, async (req, res) => {
     const { scope, user, project, brand } = res.locals.workflow;
-    if (!hasClientRole(user, String(scope.clientId), ["marketing_operator", "approver"]))
+    if (!hasClientRole(user, String(scope.clientId), ["operator", "approver"]))
       return res.sendStatus(403);
     const { clientId, briefVersion, agentKey } = req.body ?? {};
     const briefId = objectId(req.body?.briefId);
@@ -1212,7 +1212,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
 
   router.post(projectPath + "/briefs", projectScope, async (req, res) => {
     const { scope, user, project } = res.locals.workflow;
-    if (!hasClientRole(user, String(scope.clientId), ["marketing_operator", "approver"]))
+    if (!hasClientRole(user, String(scope.clientId), ["operator", "approver"]))
       return res.sendStatus(403);
     if (project.status !== "active" || res.locals.workflow.brand?.status === "archived")
       return res.status(409).json({ message: "This project is inactive." });
@@ -1308,7 +1308,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
 
   router.post(projectPath + "/runs", projectScope, async (req, res) => {
     const { user, scope, brand, project } = res.locals.workflow;
-    if (!hasClientRole(user, String(scope.clientId), ["marketing_operator", "approver"]))
+    if (!hasClientRole(user, String(scope.clientId), ["operator", "approver"]))
       return res.sendStatus(403);
     if (project.status !== "active" || !brand || brand.status === "archived")
       return res.status(409).json({ message: "This project is inactive." });
