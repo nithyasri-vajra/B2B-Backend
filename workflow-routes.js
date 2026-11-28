@@ -903,6 +903,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
         const change = decision === "approved" ? {
           status: "approved", approvedDraftVersionId: review.draftVersionId,
           "publishing.destination": review.destination, "publishing.scheduledAt": approvalSchedule ?? review.scheduledAt ?? null,
+          approvedAt: now, approvedByUserId: user._id, approvedByName: user.name ?? user.email,
         } : { status: "changes_requested" };
         await items.updateOne({ ...scope, _id: post._id }, { $set: change }, { session });
       }
