@@ -439,8 +439,8 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   });
 
   router.post(brandPath + "/knowledge/records", scope, async (req, res) => {
-    const { clientId, role, user, brand } = res.locals.brandScope;
-    if (!role("brand_manager")) return res.sendStatus(403);
+    const { clientId, role, user, brand, admin } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
     const { sourceId: sourceKey, area, recordType, statement } = req.body ?? {};
     const sourceId = parseId(sourceKey);
@@ -463,8 +463,8 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   });
 
   router.post(brandPath + "/knowledge/records/:recordId/revisions", scope, async (req, res) => {
-    const { clientId, role, user, brand } = res.locals.brandScope;
-    if (!role("brand_manager")) return res.sendStatus(403);
+    const { clientId, role, user, brand, admin } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
     const _id = parseId(req.params.recordId);
     const { currentRevision, reviewStatus } = req.body ?? {};
@@ -512,8 +512,8 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   });
 
   router.post(brandPath + "/knowledge/versions", scope, async (req, res) => {
-    const { user, clientId, role, brand } = res.locals.brandScope;
-    if (!role("brand_manager")) return res.sendStatus(403);
+    const { user, clientId, role, brand, admin } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
     const now = new Date();
     const published = await mongo.withSession((session) => session.withTransaction(async () => {
