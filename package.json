@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "db:init": "node --env-file=.env server.js --init-db",
-    "start": "node --env-file=.env server.js"
+    "start": "node --env-file=.env server.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "express": "^5.1.0",

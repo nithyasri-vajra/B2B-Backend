@@ -42,6 +42,23 @@ if (!(await db.listCollections({ name: "audit_events" }, { nameOnly: true }).has
     if (error.code !== 48) throw error;
   }
 }
+// The account named in PLATFORM_ADMIN_EMAIL is made an active Platform Admin on every start,
+// so the owner can recover admin access from the hosting settings without database access.
+const bootstrapAdmin = PLATFORM_ADMIN_EMAIL?.trim().toLowerCase();
+if (bootstrapAdmin) {
+  const now = new Date();
+  const existing = await users.findOne({ email: bootstrapAdmin });
+  const roles = Array.isArray(existing?.globalRoles) ? existing.globalRoles : [];
+  const promoted = existing && (existing.status !== "active" || !roles.includes("platform_admin")) &&
+    (await users.updateOne({ _id: existing._id }, { $set: {
+      status: "active", globalRoles: [...new Set([...roles, "platform_admin"])], updatedAt: now,
+    } })).modifiedCount ? existing : null;
+  if (promoted) {
+    await audits.insertOne({ eventType: "platform_admin_bootstrapped", outcome: "success", targetId: promoted._id,
+      occurredAt: now, details: { source: "PLATFORM_ADMIN_EMAIL" } });
+    console.log("Platform Admin access granted to the PLATFORM_ADMIN_EMAIL account.");
+  }
+}
 if (initOnly) {
   console.log(`MongoDB ready: ${db.databaseName}`);
   await mongo.close();
@@ -55,10 +72,13 @@ const google = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, origin +
 const app = express();
 const auth = express.Router();
 app.use(path, auth);
-auth.use(express.json({ limit: "16kb" }));
+// Small JSON bodies everywhere, except saving an edited knowledge file, which can be as large as an upload (2 MB).
+const smallJson = express.json({ limit: "16kb" });
+const knowledgeJson = express.json({ limit: "3mb" });
+auth.use((req, res, next) => (/\/knowledge\/records\/[^/]+\/revisions$/.test(req.path) ? knowledgeJson : smallJson)(req, res, next));
 auth.use((req, res, next) => {
   res.set("Cache-Control", "no-store");
-  if (req.method === "POST" && req.get("origin") !== origin)
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && req.get("origin") !== origin)
     return res.sendStatus(403);
   next();
 });
@@ -78,9 +98,9 @@ const signInDenialMessages = new Map([
   ["sign_in_failed", "Google sign-in couldn't be completed. Please try again."],
 ]);
 const roles = {
-  knowledge_admin: "Knowledge Admin",
+  brand_manager: "Brand Manager",
   approver: "Approver",
-  marketing_operator: "Marketing Operator",
+  operator: "Operator",
   viewer: "Viewer",
 };
 
@@ -343,7 +363,7 @@ auth.post("/clients", async (req, res) => {
   const saved = await mongo.withSession((session) => session.withTransaction(async () => {
     const manager = await users.updateOne({ _id: managerId, status: "active" }, {
       $push: { clientAssignments: {
-        clientId: String(brand._id), roles: ["knowledge_admin"], assignedByUserId: user._id, assignedAt: now,
+        clientId: String(brand._id), roles: ["brand_manager"], assignedByUserId: user._id, assignedAt: now,
       } }, $set: { updatedAt: now },
     }, { session });
     if (!manager.matchedCount) return false;
@@ -380,7 +400,7 @@ auth.get("/audit", async (req, res) => {
   const { user } = await current(req);
   const { clientId } = req.query;
   const platformAdmin = isPlatformAdmin(user);
-  if (!platformAdmin && !hasClientRole(user, clientId, ["knowledge_admin", "approver"]))
+  if (!platformAdmin && !hasClientRole(user, clientId, ["brand_manager", "approver", "viewer"]))
     return res.sendStatus(403);
   const offset = Number(req.query.offset ?? 0);
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 2147483647)

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { extname } from "node:path";
 import { finished } from "node:stream/promises";
 import express, { raw } from "express";
+import { modelStatus, skillStatus } from "./skill-status.js";
 import { GridFSBucket, ObjectId } from "mongodb";
 
 const maxKnowledgeFileBytes = 2 * 1024 * 1024;
@@ -13,6 +14,9 @@ export const parseId = (value) => typeof value === "string" && /^[a-f0-9]{24}$/i
   ? new ObjectId(value) : null;
 export const cleanText = (value) => typeof value === "string" ? value.trim() : "";
 export const idFilter = (id) => ({ $in: [id, String(id)] });
+
+const brandRoles = ["brand_manager", "approver", "operator", "viewer"];
+const brandEmail = /^[^\s@]+@vajraglobal\.com$/;
 
 const knowledgeAreas = new Map([
   ["brand.md", ["D1", "D3"]],
@@ -26,13 +30,8 @@ const claimPermissions = new Set(["public", "restricted", "internal_only"]);
 const isClaim = ({ area, recordType }) => /^claims?$/i.test(cleanText(area)) ||
   /\bclaims?\b/i.test(cleanText(recordType).replace(/_/g, " "));
 
-function canReuseClaim(revision, now) {
-  return revision?.reviewStatus === "approved" &&
-    ["A", "B", "C"].includes(revision.evidenceGrade) &&
-    Boolean(cleanText(revision.sourceReference)) &&
-    claimPermission(revision.usagePermission) === "public" &&
-    (revision.reviewDueAt == null || new Date(revision.reviewDueAt) > now);
-}
+// Text files become knowledge the skills read in full (claims.md and the learning CSVs included).
+const textKnowledgeTypes = new Set([".md", ".csv", ".txt"]);
 
 export async function resolvePublishedKnowledge(db, brand, {
   versionId = brand?.publishedKnowledgeVersionId, session, now = new Date(),
@@ -55,12 +54,12 @@ export async function resolvePublishedKnowledge(db, brand, {
     if (!entry) continue;
     const current = row.currentRevision == null ? entry :
       row.revisions.find((value) => value.revision === row.currentRevision);
-    const excluded = isClaim(row) && (!canReuseClaim(entry, now) ||
-      claimPermission(current?.usagePermission) !== "public" ||
-      ["disputed", "expired", "rejected"].includes(current?.reviewStatus));
+    // Approved knowledge goes to the skills as written; it is only left out if it was withdrawn after publishing.
+    const excluded = ["disputed", "expired", "rejected"].includes(current?.reviewStatus);
     records.push({ excluded,
       expired: entry.reviewDueAt != null && !(new Date(entry.reviewDueAt) > now),
-      data: { ...entry, recordId: row._id, area: row.area, recordType: row.recordType },
+      data: { ...entry, recordId: row._id, area: row.area, recordType: row.recordType,
+        ...(row.fileName ? { fileName: row.fileName } : {}) },
     });
   }
   return { version, records, missing: records.length !== refs.length };
@@ -73,7 +72,7 @@ export function assessReadiness(snapshot, { agentKey, brief, requireBrief = fals
     : !snapshot.version ? "Publish the brand's knowledge before starting the run."
     : snapshot.missing ? "A published knowledge revision is unavailable."
     : !knowledge.length ? "No current published knowledge applies to this scope."
-    : applicable.some(({ excluded }) => excluded) ? "Published claims without current permission or evidence were excluded."
+    : applicable.some(({ excluded }) => excluded) ? "Some published knowledge was withdrawn after publishing and was excluded."
     : knowledge.length < applicable.length ? "Some published knowledge has expired and was excluded." : null;
   const blocked = (requireBrief && brief?.validated !== true) || !snapshot.version || snapshot.missing || !knowledge.length;
   const verdict = blocked ? "BLOCKED" : reason ? "LIMITED" : "READY";
@@ -110,7 +109,7 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
     if (!brand) return res.sendStatus(404);
     const role = (...roles) => hasClientRole(user, String(clientId), roles);
     const admin = isPlatformAdmin(user);
-    if (!admin && !role("knowledge_admin", "approver", "marketing_operator", "viewer"))
+    if (!admin && !role("brand_manager", "approver", "operator", "viewer"))
       return res.sendStatus(403);
     res.locals.brandScope = { user, clientId, brand, role, admin };
     next();
@@ -123,8 +122,8 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
 
   router.patch(brandPath, scope, async (req, res) => {
     const { user, clientId, brand, role, admin } = res.locals.brandScope;
-    const manager = role("knowledge_admin") && String(brand.brandManagerUserId) === String(user._id);
-    if (!admin && !manager) return res.sendStatus(403);
+    // Brand settings: Platform Admin and every Brand Manager of this brand.
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     const update = {};
     for (const key of ["name", "website", "industry", "timezone", "spelling", "logoRef"]) {
       if (!Object.hasOwn(req.body ?? {}, key)) continue;
@@ -163,6 +162,80 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
     res.json({ brand: saved });
   });
 
+  // ---- Brand people: Platform Admin and the brand's Brand Managers manage who
+  // has which role on THIS brand. Platform-wide access stays in /api/auth/user-access.
+  const memberRow = (member, clientId) => ({
+    id: String(member._id), email: member.email, name: member.name ?? member.email, status: member.status,
+    platformAdmin: member.globalRoles?.includes("platform_admin") === true,
+    roles: (member.clientAssignments ?? []).filter((entry) => String(entry.clientId) === String(clientId))
+      .flatMap(({ roles }) => roles),
+  });
+
+  router.get(brandPath + "/members", scope, async (req, res) => {
+    const { clientId, admin, role } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
+    const members = await db.collection("users").find(
+      { "clientAssignments.clientId": idFilter(clientId) }, { projection: { googleSub: 0 } },
+    ).sort({ email: 1 }).toArray();
+    res.json({ members: members.map((member) => memberRow(member, clientId)) });
+  });
+
+  router.put(brandPath + "/members", scope, async (req, res) => {
+    const { user, clientId, brand, admin, role } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
+    if (brand.status === "archived") return res.sendStatus(409);
+    const email = cleanText(req.body?.email).toLowerCase();
+    const roles = req.body?.roles;
+    if (!brandEmail.test(email) || !Array.isArray(roles) || roles.length > brandRoles.length ||
+        !roles.every((value) => brandRoles.includes(value))) return res.sendStatus(400);
+    const nextRoles = [...new Set(roles)];
+    const users = db.collection("users");
+    const result = await mongo.withSession((session) => session.withTransaction(async () => {
+      const target = await users.findOne({ email }, { session });
+      if (target?._id.equals(user._id)) return { status: 403, message: "You can't change your own roles." };
+      if (target?.globalRoles?.includes("platform_admin"))
+        return { status: 409, message: "Platform Admins already have access to every brand." };
+      if (target && ["suspended", "deactivated"].includes(target.status))
+        return { status: 409, message: "This person's account is suspended. Ask a Platform Admin." };
+      const assigned = target?.clientAssignments ?? [];
+      const previous = assigned.find((entry) => String(entry.clientId) === String(clientId));
+      if (!target && !nextRoles.length) return { status: 404 };
+      const namedApprover = target && [brand.defaultApproverUserId, brand.backupApproverUserId]
+        .some((id) => id && String(id) === String(target._id));
+      if (namedApprover && !nextRoles.includes("approver"))
+        return { status: 409, message: "This person is a named approver. Pick another approver in brand settings first." };
+      const now = new Date();
+      const others = assigned.filter((entry) => String(entry.clientId) !== String(clientId));
+      const clientAssignments = nextRoles.length ? [...others, {
+        clientId: String(clientId), roles: nextRoles, assignedByUserId: user._id, assignedAt: now,
+      }] : others;
+      let saved;
+      if (target) {
+        const status = clientAssignments.length ? (target.status === "pending" ? "active" : target.status) : "pending";
+        saved = await users.findOneAndUpdate({ _id: target._id, updatedAt: target.updatedAt ?? null },
+          { $set: { clientAssignments, status, updatedAt: now } },
+          { session, returnDocument: "after", projection: { googleSub: 0 } });
+        if (!saved) return { status: 409, message: "This person's access just changed. Reload and try again." };
+      } else {
+        saved = {
+          _id: new ObjectId(), googleSub: null, email, name: email, status: "active", globalRoles: [],
+          clientAssignments, accessRequestedAt: null, accessRequestNote: null, accessRequestNoteAt: null,
+          createdAt: now, updatedAt: now,
+        };
+        await users.insertOne(saved, { session });
+      }
+      await db.collection("audit_events").insertOne({
+        clientId, eventType: "user_access_changed", outcome: "success", actorUserId: user._id,
+        targetUserId: saved._id, occurredAt: now,
+        details: { action: "brand_roles", before: previous?.roles ?? [], after: nextRoles },
+      }, { session });
+      return { status: 200, member: memberRow(saved, clientId) };
+    }));
+    if (result.status !== 200) return result.message
+      ? res.status(result.status).json({ message: result.message }) : res.sendStatus(result.status);
+    res.json({ member: result.member });
+  });
+
   router.get(brandPath + "/knowledge/readiness", scope, async (req, res) => {
     const { brand } = res.locals.brandScope;
     const snapshot = await resolvePublishedKnowledge(db, brand);
@@ -178,7 +251,7 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
 
   router.get(brandPath + "/knowledge/sources", scope, async (req, res) => {
     const { clientId, admin, role } = res.locals.brandScope;
-    if (!admin && !role("knowledge_admin")) return res.sendStatus(403);
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     const filter = { clientId };
     const [active, legacy] = await Promise.all([
       sources.find(filter).toArray(), db.collection("knowledgeSource").find(filter).toArray(),
@@ -190,7 +263,7 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
 
   router.post(brandPath + "/knowledge/files/:filename", scope, (req, res, next) => {
     const { admin, role, brand } = res.locals.brandScope;
-    if (!admin && !role("knowledge_admin")) return res.sendStatus(403);
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
     if (!knowledgeAreas.has(req.params.filename) || !req.is("application/octet-stream"))
       return res.status(400).json({ message: "Choose one of the five knowledge Markdown files." });
@@ -239,7 +312,7 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
 
   router.post(brandPath + "/knowledge/sources", scope, async (req, res) => {
     const { user, role, admin, clientId, brand } = res.locals.brandScope;
-    if (!admin && !role("knowledge_admin")) return res.sendStatus(403);
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
     const { sourceType, areas } = req.body ?? {};
     const title = cleanText(req.body?.title);
@@ -264,7 +337,7 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   const readUpload = raw({ type: "multipart/form-data", limit: maxKnowledgeFileBytes + 64 * 1024 });
   router.post(brandPath + "/knowledge/sources/upload", scope, (req, res, next) => {
     const { role, admin, brand } = res.locals.brandScope;
-    if (!admin && !role("knowledge_admin")) return res.sendStatus(403);
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
     if (!req.is("multipart/form-data"))
       return res.status(415).json({ message: "Send the file as multipart form data." });
@@ -298,36 +371,62 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
 
     const bytes = Buffer.from(await file.arrayBuffer());
     let statement;
-    if (extension === ".md") {
+    if (textKnowledgeTypes.has(extension)) {
       try {
-        statement = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
+        statement = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, "").trim();
       } catch {
-        return res.status(400).json({ message: "Save the Markdown file as UTF-8 and try again." });
+        return res.status(400).json({ message: title + ": save the file as UTF-8 and try again." });
       }
       if (!statement || statement.includes("\0"))
-        return res.status(400).json({ message: "Add readable text to the Markdown file." });
+        return res.status(400).json({ message: title + ": add readable text to the file." });
     }
 
     const now = new Date();
     const fileId = new ObjectId();
-    const source = {
+    // Uploading a file with the same name again adds the next revision to its record instead of a duplicate.
+    const previousSource = statement ? await sources.findOne({ clientId, sourceType: "file", title },
+      { sort: { createdAt: -1 } }) : null;
+    const previousRecord = previousSource && await records.findOne({ clientId, sourceId: previousSource._id },
+      { sort: { createdAt: 1 } });
+    // A file uploaded before it could be read (for example a CSV from before text support) is turned into a record in place.
+    const reuseSource = Boolean(previousSource && !previousRecord);
+    const source = previousRecord || reuseSource ? { ...previousSource, areas, fileRef: String(fileId), processingStatus: "completed",
+      uploadedByUserId: user._id, updatedAt: now } : {
       _id: new ObjectId(), clientId, sourceType: "file", title, areas,
       fileRef: String(fileId), processingStatus: statement ? "completed" : "pending",
       uploadedByUserId: user._id, createdAt: now, updatedAt: now,
     };
-    const record = statement ? {
-      _id: new ObjectId(), clientId, sourceId: source._id, area: areas[0], recordType: "document",
-      currentRevision: 1, revisions: [{ revision: 1, statement, agentKey: null, reviewStatus: "needs_review" }],
+    const record = !statement || previousRecord ? null : {
+      _id: new ObjectId(), clientId, sourceId: source._id, area: areas[0], recordType: "document", fileName: title,
+      currentRevision: 1, revisions: [{ revision: 1, statement, agentKey: null, reviewStatus: "needs_review",
+        uploadedByUserId: user._id, uploadedAt: now }],
       createdAt: now, updatedAt: now,
-    } : null;
+    };
     const bucket = new GridFSBucket(db, { bucketName: "knowledgeFiles" });
+    let saved = record;
     try {
       const upload = bucket.openUploadStreamWithId(fileId, title, { metadata: { clientId, sourceId: source._id } });
       const uploaded = finished(upload);
       upload.end(bytes);
       await uploaded;
       await mongo.withSession((session) => session.withTransaction(async () => {
-        await sources.insertOne(source, { session });
+        if (previousRecord) {
+          const revision = { revision: previousRecord.currentRevision + 1, statement, agentKey: null,
+            reviewStatus: "needs_review", uploadedByUserId: user._id, uploadedAt: now };
+          saved = await records.findOneAndUpdate({ _id: previousRecord._id, clientId, currentRevision: previousRecord.currentRevision },
+            { $set: { currentRevision: revision.revision, fileName: title, updatedAt: now }, $push: { revisions: revision } },
+            { session, returnDocument: "after" });
+          if (!saved) throw Object.assign(new Error("Knowledge record changed during upload."), { status: 409 });
+          await sources.updateOne({ _id: source._id, clientId }, { $set: {
+            areas, fileRef: source.fileRef, processingStatus: "completed", uploadedByUserId: user._id, updatedAt: now,
+          } }, { session });
+          await audit(user, clientId, "knowledge_record_revised_by_upload", saved._id, { revision: revision.revision }, session);
+          return;
+        }
+        if (reuseSource) await sources.updateOne({ _id: source._id, clientId }, { $set: {
+          areas, fileRef: source.fileRef, processingStatus: "completed", uploadedByUserId: user._id, updatedAt: now,
+        } }, { session });
+        else await sources.insertOne(source, { session });
         if (record) await records.insertOne(record, { session });
         await audit(user, clientId, "knowledge_source_added", source._id, {}, session);
         if (record) await audit(user, clientId, "knowledge_record_created", record._id, {}, session);
@@ -341,20 +440,34 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
             console.error("Knowledge upload cleanup failed", cleanupError.name);
         }
       }
+      if (error.status === 409) return res.status(409).json({ message: title + " was changed by someone else. Try again." });
       throw error;
     }
-    res.status(201).json({ source, record });
+    res.status(previousRecord ? 200 : 201).json({ source, record: saved, revised: Boolean(previousRecord) });
+  });
+
+  // Version history for the Knowledge overview: number, when, by whom, the note and how many files.
+  router.get(brandPath + "/knowledge/versions", scope, async (req, res) => {
+    const { clientId, role, admin } = res.locals.brandScope;
+    if (!admin && !role("brand_manager", "approver", "operator", "viewer")) return res.sendStatus(403);
+    const rows = await versions.find({ clientId: idFilter(clientId), status: "published" })
+      .sort({ version: -1 }).limit(50).toArray();
+    const people = await db.collection("users").find({ _id: { $in: rows.map(({ publishedByUserId }) => publishedByUserId).filter(Boolean) } })
+      .project({ name: 1, email: 1 }).toArray();
+    const names = new Map(people.map((person) => [String(person._id), person.name || person.email]));
+    res.json({ knowledgeVersions: rows.map((row) => ({ id: String(row._id), version: row.version, publishedAt: row.publishedAt,
+      note: row.note ?? null, files: row.recordRevisions?.length ?? 0, publishedBy: names.get(String(row.publishedByUserId)) ?? null })) });
   });
 
   router.get(brandPath + "/knowledge/records", scope, async (req, res) => {
     const { clientId, role, admin } = res.locals.brandScope;
-    if (!admin && !role("knowledge_admin", "approver", "marketing_operator")) return res.sendStatus(403);
+    if (!admin && !role("brand_manager", "approver", "operator", "viewer")) return res.sendStatus(403);
     const filter = { clientId };
     for (const key of ["area", "recordType"]) {
       if (typeof req.query[key] === "string") filter[key] = req.query[key];
     }
     const rows = await records.find(filter).sort({ updatedAt: -1 }).toArray();
-    if (admin || role("knowledge_admin")) return res.json({ knowledgeRecords: rows });
+    if (admin || role("brand_manager")) return res.json({ knowledgeRecords: rows });
     res.json({ knowledgeRecords: rows.flatMap((record) => {
       const revision = record.revisions.find((entry) => entry.revision === record.currentRevision);
       return revision?.reviewStatus === "approved" ? [{ ...record, revisions: [revision] }] : [];
@@ -362,8 +475,8 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   });
 
   router.post(brandPath + "/knowledge/records", scope, async (req, res) => {
-    const { clientId, role, user, brand } = res.locals.brandScope;
-    if (!role("knowledge_admin")) return res.sendStatus(403);
+    const { clientId, role, user, brand, admin } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
     const { sourceId: sourceKey, area, recordType, statement } = req.body ?? {};
     const sourceId = parseId(sourceKey);
@@ -386,8 +499,8 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   });
 
   router.post(brandPath + "/knowledge/records/:recordId/revisions", scope, async (req, res) => {
-    const { clientId, role, user, brand } = res.locals.brandScope;
-    if (!role("knowledge_admin")) return res.sendStatus(403);
+    const { clientId, role, user, brand, admin } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
     const _id = parseId(req.params.recordId);
     const { currentRevision, reviewStatus } = req.body ?? {};
@@ -435,19 +548,20 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
   });
 
   router.post(brandPath + "/knowledge/versions", scope, async (req, res) => {
-    const { user, clientId, role, brand } = res.locals.brandScope;
-    if (!role("knowledge_admin")) return res.sendStatus(403);
+    const { user, clientId, role, brand, admin } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
+    const note = cleanText(req.body?.note).slice(0, 500);
     const now = new Date();
     const published = await mongo.withSession((session) => session.withTransaction(async () => {
       const versionId = new ObjectId();
       const approvedRecords = (await records.aggregate([
         { $match: { clientId } }, { $unwind: "$revisions" },
         { $match: { $expr: { $eq: ["$currentRevision", "$revisions.revision"] },
-          "revisions.reviewStatus": "approved", "revisions.evidenceGrade": { $in: ["A", "B", "C"] },
+          "revisions.reviewStatus": "approved",
           $or: [{ "revisions.reviewDueAt": null }, { "revisions.reviewDueAt": { $gt: now } }] } },
         { $project: { revision: "$currentRevision", area: 1, recordType: 1, data: "$revisions" } },
-      ], { session }).toArray()).filter((record) => !isClaim(record) || canReuseClaim(record.data, now));
+      ], { session }).toArray());
       if (!approvedRecords.length) return null;
       const lock = await brands.updateOne({
         _id: clientId, status: { $ne: "archived" },
@@ -460,7 +574,7 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
       const version = {
         _id: versionId, clientId, version: (latest?.version ?? 0) + 1, status: "published",
         recordRevisions: approvedRecords.map(({ _id, revision }) => ({ recordId: _id, revision })),
-        publishedByUserId: user._id, publishedAt: now,
+        publishedByUserId: user._id, publishedAt: now, ...(note ? { note } : {}),
       };
       await versions.insertOne(version, { session });
       await audit(user, clientId, "knowledge_version_published", versionId, { version: version.version }, session);
@@ -478,6 +592,6 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
       "versions.version": 1, "versions.pipeline.stageKey": 1, "versions.pipeline.order": 1,
       "versions.pipeline.gate": 1, "versions.runLimits": 1, "versions.briefTemplate.version": 1,
     }).sort({ name: 1 }).toArray();
-    res.json({ agents: rows });
+    res.json({ agents: rows, skills: skillStatus(), openai: modelStatus() });
   });
 }
