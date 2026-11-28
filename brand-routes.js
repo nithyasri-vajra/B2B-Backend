@@ -14,6 +14,9 @@ export const parseId = (value) => typeof value === "string" && /^[a-f0-9]{24}$/i
 export const cleanText = (value) => typeof value === "string" ? value.trim() : "";
 export const idFilter = (id) => ({ $in: [id, String(id)] });
 
+const brandRoles = ["brand_manager", "approver", "operator", "viewer"];
+const brandEmail = /^[^\s@]+@vajraglobal\.com$/;
+
 const knowledgeAreas = new Map([
   ["brand.md", ["D1", "D3"]],
   ["claims.md", ["D2"]],
@@ -123,8 +126,8 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
 
   router.patch(brandPath, scope, async (req, res) => {
     const { user, clientId, brand, role, admin } = res.locals.brandScope;
-    const manager = role("brand_manager") && String(brand.brandManagerUserId) === String(user._id);
-    if (!admin && !manager) return res.sendStatus(403);
+    // Brand settings: Platform Admin and every Brand Manager of this brand.
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
     const update = {};
     for (const key of ["name", "website", "industry", "timezone", "spelling", "logoRef"]) {
       if (!Object.hasOwn(req.body ?? {}, key)) continue;
@@ -161,6 +164,80 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
     }));
     if (!saved) return res.sendStatus(409);
     res.json({ brand: saved });
+  });
+
+  // ---- Brand people: Platform Admin and the brand's Brand Managers manage who
+  // has which role on THIS brand. Platform-wide access stays in /api/auth/user-access.
+  const memberRow = (member, clientId) => ({
+    id: String(member._id), email: member.email, name: member.name ?? member.email, status: member.status,
+    platformAdmin: member.globalRoles?.includes("platform_admin") === true,
+    roles: (member.clientAssignments ?? []).filter((entry) => String(entry.clientId) === String(clientId))
+      .flatMap(({ roles }) => roles),
+  });
+
+  router.get(brandPath + "/members", scope, async (req, res) => {
+    const { clientId, admin, role } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
+    const members = await db.collection("users").find(
+      { "clientAssignments.clientId": idFilter(clientId) }, { projection: { googleSub: 0 } },
+    ).sort({ email: 1 }).toArray();
+    res.json({ members: members.map((member) => memberRow(member, clientId)) });
+  });
+
+  router.put(brandPath + "/members", scope, async (req, res) => {
+    const { user, clientId, brand, admin, role } = res.locals.brandScope;
+    if (!admin && !role("brand_manager")) return res.sendStatus(403);
+    if (brand.status === "archived") return res.sendStatus(409);
+    const email = cleanText(req.body?.email).toLowerCase();
+    const roles = req.body?.roles;
+    if (!brandEmail.test(email) || !Array.isArray(roles) || roles.length > brandRoles.length ||
+        !roles.every((value) => brandRoles.includes(value))) return res.sendStatus(400);
+    const nextRoles = [...new Set(roles)];
+    const users = db.collection("users");
+    const result = await mongo.withSession((session) => session.withTransaction(async () => {
+      const target = await users.findOne({ email }, { session });
+      if (target?._id.equals(user._id)) return { status: 403, message: "You can't change your own roles." };
+      if (target?.globalRoles?.includes("platform_admin"))
+        return { status: 409, message: "Platform Admins already have access to every brand." };
+      if (target && ["suspended", "deactivated"].includes(target.status))
+        return { status: 409, message: "This person's account is suspended. Ask a Platform Admin." };
+      const assigned = target?.clientAssignments ?? [];
+      const previous = assigned.find((entry) => String(entry.clientId) === String(clientId));
+      if (!target && !nextRoles.length) return { status: 404 };
+      const namedApprover = target && [brand.defaultApproverUserId, brand.backupApproverUserId]
+        .some((id) => id && String(id) === String(target._id));
+      if (namedApprover && !nextRoles.includes("approver"))
+        return { status: 409, message: "This person is a named approver. Pick another approver in brand settings first." };
+      const now = new Date();
+      const others = assigned.filter((entry) => String(entry.clientId) !== String(clientId));
+      const clientAssignments = nextRoles.length ? [...others, {
+        clientId: String(clientId), roles: nextRoles, assignedByUserId: user._id, assignedAt: now,
+      }] : others;
+      let saved;
+      if (target) {
+        const status = clientAssignments.length ? (target.status === "pending" ? "active" : target.status) : "pending";
+        saved = await users.findOneAndUpdate({ _id: target._id, updatedAt: target.updatedAt ?? null },
+          { $set: { clientAssignments, status, updatedAt: now } },
+          { session, returnDocument: "after", projection: { googleSub: 0 } });
+        if (!saved) return { status: 409, message: "This person's access just changed. Reload and try again." };
+      } else {
+        saved = {
+          _id: new ObjectId(), googleSub: null, email, name: email, status: "active", globalRoles: [],
+          clientAssignments, accessRequestedAt: null, accessRequestNote: null, accessRequestNoteAt: null,
+          createdAt: now, updatedAt: now,
+        };
+        await users.insertOne(saved, { session });
+      }
+      await db.collection("audit_events").insertOne({
+        clientId, eventType: "user_access_changed", outcome: "success", actorUserId: user._id,
+        targetUserId: saved._id, occurredAt: now,
+        details: { action: "brand_roles", before: previous?.roles ?? [], after: nextRoles },
+      }, { session });
+      return { status: 200, member: memberRow(saved, clientId) };
+    }));
+    if (result.status !== 200) return result.message
+      ? res.status(result.status).json({ message: result.message }) : res.sendStatus(result.status);
+    res.json({ member: result.member });
   });
 
   router.get(brandPath + "/knowledge/readiness", scope, async (req, res) => {

@@ -58,7 +58,7 @@ app.use(path, auth);
 auth.use(express.json({ limit: "16kb" }));
 auth.use((req, res, next) => {
   res.set("Cache-Control", "no-store");
-  if (req.method === "POST" && req.get("origin") !== origin)
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && req.get("origin") !== origin)
     return res.sendStatus(403);
   next();
 });
