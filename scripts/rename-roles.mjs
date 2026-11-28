@@ -4,9 +4,12 @@
 // Run once, before deploying the backend that uses the new names:
 //   MONGODB_URI="mongodb+srv://..." node scripts/rename-roles.mjs
 // Add --dry-run to only count the users that would change. Safe to run twice.
+// Rollback (only if you roll the backend back to the old code): add --reverse.
 import { MongoClient } from "mongodb";
 
-const renames = { knowledge_admin: "brand_manager", marketing_operator: "operator" };
+const forward = { knowledge_admin: "brand_manager", marketing_operator: "operator" };
+const renames = process.argv.includes("--reverse")
+  ? Object.fromEntries(Object.entries(forward).map(([from, to]) => [to, from])) : forward;
 const dryRun = process.argv.includes("--dry-run");
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB ?? "b2b_agents";
@@ -43,8 +46,8 @@ try {
   // Allow both names while the documents change, then keep only the new names.
   if (validator) {
     const both = JSON.parse(JSON.stringify(validator).replaceAll(
-      /"enum":\[([^\]]*"knowledge_admin"[^\]]*)\]/g,
-      (_, list) => `"enum":[${list},"brand_manager","operator"]`,
+      new RegExp(`"enum":\\[([^\\]]*"${Object.keys(renames)[0]}"[^\\]]*)\\]`, "g"),
+      (_, list) => `"enum":[${list},${Object.values(renames).map((role) => JSON.stringify(role)).join(",")}]`,
     ));
     await db.command({ collMod: "users", validator: both, validationLevel: level });
   }
