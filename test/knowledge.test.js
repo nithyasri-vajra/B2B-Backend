@@ -101,6 +101,20 @@ test("Markdown and CSV uploads become records; the same file name adds the next 
   } finally { t.close(); }
 });
 
+test("A file stored before it could be read becomes a record in place when uploaded again", async () => {
+  const t = await setup();
+  try {
+    const old = { _id: new ObjectId(), clientId: t.clientId, sourceType: "file", title: "learning_feedback.csv", areas: ["learning"],
+      processingStatus: "pending", createdAt: new Date(Date.now() - 86400000) };
+    await t.db.collection("knowledgeSources").insertOne(old);
+    const res = await t.upload("learning_feedback.csv", "date,feedback\n2026-11-01,Shorter please", ["learning"]);
+    assert.equal(res.status, 201);
+    assert.equal(String(res.body.record.sourceId), String(old._id));
+    assert.equal(t.db.collection("knowledgeSources").rows.length, 1, "no second source row");
+    assert.equal(t.db.collection("knowledgeSources").rows[0].processingStatus, "completed");
+  } finally { t.close(); }
+});
+
 test("Publishing takes every approved file without a grade, keeps claims.md, and saves the note", async () => {
   const t = await setup();
   try {

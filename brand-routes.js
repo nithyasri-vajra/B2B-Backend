@@ -388,7 +388,9 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
       { sort: { createdAt: -1 } }) : null;
     const previousRecord = previousSource && await records.findOne({ clientId, sourceId: previousSource._id },
       { sort: { createdAt: 1 } });
-    const source = previousRecord ? { ...previousSource, areas, fileRef: String(fileId), processingStatus: "completed",
+    // A file uploaded before it could be read (for example a CSV from before text support) is turned into a record in place.
+    const reuseSource = Boolean(previousSource && !previousRecord);
+    const source = previousRecord || reuseSource ? { ...previousSource, areas, fileRef: String(fileId), processingStatus: "completed",
       uploadedByUserId: user._id, updatedAt: now } : {
       _id: new ObjectId(), clientId, sourceType: "file", title, areas,
       fileRef: String(fileId), processingStatus: statement ? "completed" : "pending",
@@ -421,7 +423,10 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
           await audit(user, clientId, "knowledge_record_revised_by_upload", saved._id, { revision: revision.revision }, session);
           return;
         }
-        await sources.insertOne(source, { session });
+        if (reuseSource) await sources.updateOne({ _id: source._id, clientId }, { $set: {
+          areas, fileRef: source.fileRef, processingStatus: "completed", uploadedByUserId: user._id, updatedAt: now,
+        } }, { session });
+        else await sources.insertOne(source, { session });
         if (record) await records.insertOne(record, { session });
         await audit(user, clientId, "knowledge_source_added", source._id, {}, session);
         if (record) await audit(user, clientId, "knowledge_record_created", record._id, {}, session);
