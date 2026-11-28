@@ -762,6 +762,35 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
       targetType, targetId, details, occurredAt: new Date(),
     }, { session });
 
+  // Platform Admin view of background jobs (post writing and feedback regeneration).
+  router.get("/workflow/admin/jobs", async (req, res) => {
+    const { user } = await current(req);
+    if (!user) return res.sendStatus(401);
+    if (!isPlatformAdmin(user)) return res.sendStatus(403);
+    const status = req.query.status;
+    if (status !== undefined && !["queued", "running", "completed", "blocked", "failed", "cancelled"].includes(status))
+      return res.sendStatus(400);
+    const jobs = await writingJobs.find(status ? { status } : {}, {
+      projection: { feedback: 0 },
+    }).sort({ createdAt: -1, _id: -1 }).limit(200).toArray();
+    const brandIds = [...new Set(jobs.map(({ clientId }) => String(clientId)))].map((id) => objectId(id)).filter(Boolean);
+    const runIds = [...new Set(jobs.map(({ runId }) => String(runId)))].map((id) => objectId(id)).filter(Boolean);
+    const [brandRows, runRows] = await Promise.all([
+      brandIds.length ? db.collection("brands").find({ _id: { $in: brandIds } }, { projection: { name: 1 } }).toArray() : [],
+      runIds.length ? runs.find({ _id: { $in: runIds } }, { projection: { title: 1, status: 1 } }).toArray() : [],
+    ]);
+    const now = Date.now();
+    res.json({ jobs: jobs.map((job) => ({
+      id: String(job._id), kind: job.kind ?? "draft", status: job.status, attempts: job.attempts ?? 0,
+      clientId: String(job.clientId), brandName: brandRows.find(({ _id }) => String(_id) === String(job.clientId))?.name ?? null,
+      projectId: String(job.projectId), runId: job.runId ? String(job.runId) : null,
+      runTitle: runRows.find(({ _id }) => String(_id) === String(job.runId))?.title ?? null,
+      contentItemId: job.contentItemId ? String(job.contentItemId) : null,
+      createdAt: job.createdAt ?? null, finishedAt: job.finishedAt ?? null, failureReason: job.failureReason ?? null,
+      stuck: job.status === "running" && job.availableAt && +new Date(job.availableAt) < now,
+    })) });
+  });
+
   router.get("/workflow/approvals", async (req, res) => {
     const { user } = await current(req);
     if (!user) return res.sendStatus(401);
