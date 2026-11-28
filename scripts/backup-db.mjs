@@ -4,7 +4,9 @@
 // Restore replaces each collection's documents with the ones in the backup. Indexes and validators stay as they are.
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { EJSON, MongoClient } from "mongodb";
+import { BSON, MongoClient } from "mongodb";
+
+const { EJSON } = BSON;
 
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB ?? "b2b_agents";
