@@ -38,7 +38,7 @@ function collection() {
     rows,
     async findOne(filter, options = {}) { return sorted(rows.filter((row) => matches(row, filter)), options.sort)[0] ?? null; },
     find(filter) { let list = rows.filter((row) => matches(row, filter)); const cursor = {
-      sort(sort) { list = sorted(list, sort); return cursor; }, project() { return cursor; }, async toArray() { return list; } }; return cursor; },
+      sort(sort) { list = sorted(list, sort); return cursor; }, limit(n) { list = list.slice(0, n); return cursor; }, project() { return cursor; }, async toArray() { return list; } }; return cursor; },
     async insertOne(doc) { rows.push({ ...doc }); return { insertedId: doc._id }; },
     async insertMany(docs) { for (const doc of docs) rows.push({ ...doc }); return {}; },
     async updateOne(filter, update) { const row = rows.find((entry) => matches(entry, filter)); if (row) apply(row, update); return { matchedCount: row ? 1 : 0 }; },
@@ -77,7 +77,7 @@ async function setup() {
   };
   const post = async (path, body) => { const res = await fetch(base + path, { method: "POST",
     headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); return { status: res.status, body: res.status === 409 ? null : await res.json() }; };
-  return { db, clientId, upload, post, close: () => server.close() };
+  return { db, clientId, base, upload, post, close: () => server.close() };
 }
 
 test("Markdown and CSV uploads become records; the same file name adds the next revision", async () => {
@@ -118,6 +118,9 @@ test("Publishing takes every approved file without a grade, keeps claims.md, and
     assert.deepEqual(ids, [String(claims._id), String(posts._id)].sort());
     assert.ok(!ids.includes(String(pending._id)), "files waiting for review are not published");
 
+    const history = await (await fetch(t.base + "/knowledge/versions")).json();
+    assert.equal(history.knowledgeVersions[0].note, "First full knowledge set");
+    assert.equal(history.knowledgeVersions[0].files, 2);
     const brand = await t.db.collection("brands").findOne({ _id: t.clientId });
     const snapshot = await resolvePublishedKnowledge(t.db, brand);
     const { knowledge, readiness } = assessReadiness(snapshot);

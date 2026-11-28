@@ -441,6 +441,19 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
     res.status(previousRecord ? 200 : 201).json({ source, record: saved, revised: Boolean(previousRecord) });
   });
 
+  // Version history for the Knowledge overview: number, when, by whom, the note and how many files.
+  router.get(brandPath + "/knowledge/versions", scope, async (req, res) => {
+    const { clientId, role, admin } = res.locals.brandScope;
+    if (!admin && !role("brand_manager", "approver", "operator", "viewer")) return res.sendStatus(403);
+    const rows = await versions.find({ clientId: idFilter(clientId), status: "published" })
+      .sort({ version: -1 }).limit(50).toArray();
+    const people = await db.collection("users").find({ _id: { $in: rows.map(({ publishedByUserId }) => publishedByUserId).filter(Boolean) } })
+      .project({ name: 1, email: 1 }).toArray();
+    const names = new Map(people.map((person) => [String(person._id), person.name || person.email]));
+    res.json({ knowledgeVersions: rows.map((row) => ({ id: String(row._id), version: row.version, publishedAt: row.publishedAt,
+      note: row.note ?? null, files: row.recordRevisions?.length ?? 0, publishedBy: names.get(String(row.publishedByUserId)) ?? null })) });
+  });
+
   router.get(brandPath + "/knowledge/records", scope, async (req, res) => {
     const { clientId, role, admin } = res.locals.brandScope;
     if (!admin && !role("brand_manager", "approver", "operator", "viewer")) return res.sendStatus(403);
