@@ -42,6 +42,23 @@ if (!(await db.listCollections({ name: "audit_events" }, { nameOnly: true }).has
     if (error.code !== 48) throw error;
   }
 }
+// The account named in PLATFORM_ADMIN_EMAIL is made an active Platform Admin on every start,
+// so the owner can recover admin access from the hosting settings without database access.
+const bootstrapAdmin = PLATFORM_ADMIN_EMAIL?.trim().toLowerCase();
+if (bootstrapAdmin) {
+  const now = new Date();
+  const existing = await users.findOne({ email: bootstrapAdmin });
+  const roles = Array.isArray(existing?.globalRoles) ? existing.globalRoles : [];
+  const promoted = existing && (existing.status !== "active" || !roles.includes("platform_admin")) &&
+    (await users.updateOne({ _id: existing._id }, { $set: {
+      status: "active", globalRoles: [...new Set([...roles, "platform_admin"])], updatedAt: now,
+    } })).modifiedCount ? existing : null;
+  if (promoted) {
+    await audits.insertOne({ eventType: "platform_admin_bootstrapped", outcome: "success", targetId: promoted._id,
+      occurredAt: now, details: { source: "PLATFORM_ADMIN_EMAIL" } });
+    console.log("Platform Admin access granted to the PLATFORM_ADMIN_EMAIL account.");
+  }
+}
 if (initOnly) {
   console.log(`MongoDB ready: ${db.databaseName}`);
   await mongo.close();
