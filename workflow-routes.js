@@ -789,6 +789,12 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     const reason = cleanText(req.body?.reason);
     if (!_id || !["approved", "changes_requested", "rejected"].includes(decision) ||
       (decision !== "approved" && !reason)) return res.sendStatus(400);
+    // Gate 2 approval may set the publishing date and time; it must be in the future.
+    const requestedSchedule = req.body?.scheduledAt;
+    const approvalSchedule = typeof requestedSchedule === "string" ? new Date(requestedSchedule) : null;
+    if (requestedSchedule != null && (!approvalSchedule || !(approvalSchedule > new Date()) ||
+      approvalSchedule.toISOString() !== requestedSchedule))
+      return res.status(400).json({ message: "Choose a future publishing date and time." });
     if (brand?.status === "archived") return res.sendStatus(409);
     const review = await decisions.findOne({ ...scope, _id, assignedReviewerId: user._id });
     if (!review) return res.sendStatus(404);
@@ -798,9 +804,9 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     const approver = hasClientRole(user, String(scope.clientId), ["approver"]);
     if (review.gate === "gate_2") {
       // Post review has no reject/changes decision: the approver either gives feedback
-      // (POST /posts/:id/regenerate) or marks the post as final ("approved").
+      // (POST /posts/:id/regenerate) or approves the post with its publishing schedule.
       if (decision !== "approved")
-        return res.status(400).json({ message: "Give feedback and regenerate the post, or mark it as final." });
+        return res.status(400).json({ message: "Give feedback and regenerate the post, or approve it." });
       if (!await canDecideGate2(user, scope, run)) return res.sendStatus(403);
       const { session } = await current(req);
       if (!session || !recentStepUp(session))
@@ -846,19 +852,22 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
           const draft = await drafts.findOne({ ...scope, _id: review.draftVersionId, contentItemId: post._id }, { session });
           const { destinations } = await gate2Options(brand, project, target, session);
           if (!hasPassingQa(draft) || !destinations.includes(channelKey(review.destination)) ||
-            !validGate2Schedule(review.scheduledAt, now))
+            !validGate2Schedule(approvalSchedule ?? review.scheduledAt, now))
             return { message: "Approval requires the current QA-passed draft, a valid destination and a future schedule if set." };
           if (!await hasVerifiedClaims(scope, target, draft, session))
             return { message: "The current draft must pass claim permission verification before approval." };
         }
         const change = decision === "approved" ? {
           status: "approved", approvedDraftVersionId: review.draftVersionId,
-          "publishing.destination": review.destination, "publishing.scheduledAt": review.scheduledAt ?? null,
+          "publishing.destination": review.destination, "publishing.scheduledAt": approvalSchedule ?? review.scheduledAt ?? null,
         } : { status: "changes_requested" };
         await items.updateOne({ ...scope, _id: post._id }, { $set: change }, { session });
       }
       const result = await decisions.findOneAndUpdate(filter, {
-        $set: { status: "decided", decision, reason, decidedByUserId: user._id, decidedAt: now },
+        $set: {
+          status: "decided", decision, reason, decidedByUserId: user._id, decidedAt: now,
+          ...(review.gate === "gate_2" && approvalSchedule ? { scheduledAt: approvalSchedule } : {}),
+        },
       }, { session, returnDocument: "after" });
       if (!result) throw new Error("Approval decision changed during the transaction.");
       if (review.gate === "gate_1") {

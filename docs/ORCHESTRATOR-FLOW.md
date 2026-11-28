@@ -40,7 +40,7 @@ There is no approve or reject at post review any more:
   (`reviewerFeedback`, `regeneratedFromDraftVersionId`). If QA passes, it opens a new Gate 2
   review. While the job runs, `contentItems.regeneration.status` is `running`, and it ends as
   `completed` or `failed` (with `failureReason`).
-- **Mark as final** is the existing Gate 2 decision `approved` (with step-up sign-in, QA and
+- **Approve and schedule** is the existing Gate 2 decision `approved`, now accepting a future `scheduledAt` that is saved to `publishing.scheduledAt` (with step-up sign-in, QA and
   claim checks, all unchanged). Gate 2 no longer accepts `changes_requested` or `rejected`.
 - Gate 1 (plan review) is unchanged.
 
