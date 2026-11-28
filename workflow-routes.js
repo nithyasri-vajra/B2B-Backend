@@ -30,6 +30,9 @@ export function verifyDraftClaims(text, claims, knowledge) {
   });
 }
 const qaHandoffRule = "Review every draft and list every factual claim in items. For each claim, return the draft itemId, an exact quote from the draft, and the supporting published claim recordId and revision as strings. Use empty recordId and revision for unsupported claims. For a draft without factual claims, return one row with its itemId and empty quote, recordId and revision. Return PASS only when every draft passes QA.";
+// Automatic QA fix rounds: rewrites allowed when QA returns REVISE, before a person reviews.
+export const maxQaFixRounds = 2;
+const qaFixHandoffRule = "Revise each previous draft so that it resolves every issue in qaFeedback from the Post Quality Analyst, while keeping every brand, claim and channel rule and any reviewer feedback. Return one result per approved item and copy its itemId.";
 const validGate2Schedule =(value, now) => value == null || (value instanceof Date && value > now);
 const skillSettings = {
   "social-content-orchestrator": "ORCHESTRATOR",
@@ -206,13 +209,13 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
     };
   }
 
-  async function runStage(scope, runId, stage, input, fields) {
+  async function runStage(scope, runId, stage, input, fields, attempt = 1) {
     const active = { ...scope, _id: runId, status: "running" };
     if (!(await runs.updateOne(active, { $set: { currentStageKey: stage } })).matchedCount)
       return null;
     const { insertedId } = await executions.insertOne({
       ...scope, runId, stageKey: stage, receivingStage: input.receivingStage,
-      attempt: 1, status: "running", startedAt: new Date(),
+      attempt, status: "running", startedAt: new Date(),
     });
     let output;
     try {
@@ -385,23 +388,46 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
       "brief-qualifier": priorReport(run.qualificationResult?.qualification),
       "content-planner": priorReport(run.planningResult?.planner),
     };
-    const writer = await runStage(scope, run._id, "post-writer", {
+    const writerInput = {
       ...briefInput, receivingStage: "post-writer", plan, planVersion: job.planVersion,
       contextPackage: packages["post-writer"].report, priorOutputs: upstream, approval,
       handoffRule: "Draft each human-approved item exactly once. Copy its itemId into each result.",
-    }, ["itemId", "text"]);
+    };
+    const validDrafts = (output) => output.items.length === plan.length &&
+      new Set(output.items.map(({ itemId }) => itemId)).size === plan.length &&
+      output.items.every(({ itemId, text }) => selected.has(itemId) && cleanText(text));
+    const checkDrafts = (output, attempt) => runStage(scope, run._id, "post-quality-analyst", {
+      ...briefInput, receivingStage: "post-quality-analyst", plan, drafts: output.items, knowledge,
+      contextPackage: packages["post-quality-analyst"].report, priorOutputs: upstream, approval,
+      handoffRule: qaHandoffRule,
+    }, ["itemId", "quote", "recordId", "revision"], attempt);
+    let writer = await runStage(scope, run._id, "post-writer", writerInput, ["itemId", "text"]);
     if (!writer) return;
-    if (writer.items.length !== plan.length || new Set(writer.items.map(({ itemId }) => itemId)).size !== plan.length ||
-      writer.items.some(({ itemId, text }) => !selected.has(itemId) || !cleanText(text))) {
+    if (!validDrafts(writer)) {
       await blockRun(scope, run._id, "The writer did not return a draft for each approved plan item.");
       return;
     }
-    const qa = await runStage(scope, run._id, "post-quality-analyst", {
-      ...briefInput, receivingStage: "post-quality-analyst", plan, drafts: writer.items, knowledge,
-      contextPackage: packages["post-quality-analyst"].report, priorOutputs: upstream, approval,
-      handoffRule: qaHandoffRule,
-    }, ["itemId", "quote", "recordId", "revision"]);
+    let qa = await checkDrafts(writer, 1);
     if (!qa) return;
+    // Automatic QA fix rounds: when QA asks for revisions, the writer rewrites
+    // with the QA report, at most maxQaFixRounds times, before a person sees it.
+    const earlierQa = [];
+    for (let round = 1; qa.verdict === "REVISE" && round <= maxQaFixRounds; round += 1) {
+      earlierQa.push({ ...qa, fixRound: round - 1 });
+      const revised = await runStage(scope, run._id, "post-writer", {
+        ...writerInput, previousDrafts: writer.items, qaFeedback: qa.report, fixRound: round,
+        handoffRule: qaFixHandoffRule,
+      }, ["itemId", "text"], round + 1);
+      if (!revised) return;
+      if (!validDrafts(revised)) {
+        await blockRun(scope, run._id, "The writer did not return a revised draft for each approved plan item.");
+        return;
+      }
+      writer = revised;
+      qa = await checkDrafts(writer, round + 1);
+      if (!qa) return;
+    }
+    const qaFixRounds = earlierQa.length;
     const project = await db.collection("projects").findOne({ _id: scope.projectId });
     const { agent, destinations } = await gate2Options(brand, project, run);
     const destination = channelKey(agent?.destination) || channelKey(run.channel);
@@ -456,7 +482,8 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
         await drafts.insertOne({
           ...scope, _id: draftVersionId, contentItemId, version: 1,
           text,
-          qaChecks: [finalQa], claims: verifiedClaims.get(String(item.itemId)),
+          qaChecks: [finalQa], qaFixRounds, qaFixHistory: earlierQa,
+          claims: verifiedClaims.get(String(item.itemId)),
           claimPermissionsVerified: claimsPassed, comments: [], createdAt: now, createdByUserId: run.ownerUserId,
         }, { session });
         if (!reason) await decisions.insertOne(gate2Review(
@@ -531,10 +558,10 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
       "brief-qualifier": priorReport(run.qualificationResult?.qualification),
       "content-planner": priorReport(run.planningResult?.planner),
     };
-    const recordStage = async (stageKey, execute) => {
+    const recordStage = async (stageKey, execute, attempt = 1) => {
       const { insertedId } = await executions.insertOne({
         ...scope, runId: run._id, contentItemId: post._id, stageKey, receivingStage: stageKey,
-        trigger: "post_feedback", attempt: 1, status: "running", startedAt: new Date(),
+        trigger: "post_feedback", attempt, status: "running", startedAt: new Date(),
       });
       try {
         const output = await execute();
@@ -545,21 +572,36 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
         throw error;
       }
     };
-    const writer = await recordStage("post-writer", () => executeSkill("post-writer", {
+    const writerInput = {
       ...briefInput, receivingStage: "post-writer", plan, planVersion: revision.version,
       contextPackage: packages["post-writer"].report, priorOutputs: upstream, approval,
       previousDraft: { itemId, version: previous.version, text: previous.text },
       reviewerFeedback: job.feedback,
       handoffRule: "Revise the previous draft for this one approved item so that it fully addresses the reviewer feedback, while keeping every brand, claim and channel rule. Return exactly one result and copy its itemId.",
-    }, ["itemId", "text"]));
-    if (writer.verdict === "BLOCKED") return writer.report;
-    const draft = writer.items.length === 1 && writer.items[0].itemId === itemId && cleanText(writer.items[0].text) && writer.items[0];
-    if (!draft) return "The writer did not return one revised draft for this post.";
-    const qa = await recordStage("post-quality-analyst", () => executeSkill("post-quality-analyst", {
-      ...briefInput, receivingStage: "post-quality-analyst", plan, drafts: [draft], knowledge,
+    };
+    const oneDraft = (output) => output.items.length === 1 && output.items[0].itemId === itemId &&
+      cleanText(output.items[0].text) ? output.items[0] : null;
+    const checkDraft = (candidate, attempt) => recordStage("post-quality-analyst", () => executeSkill("post-quality-analyst", {
+      ...briefInput, receivingStage: "post-quality-analyst", plan, drafts: [candidate], knowledge,
       contextPackage: packages["post-quality-analyst"].report, priorOutputs: upstream, approval,
       reviewerFeedback: job.feedback, handoffRule: qaHandoffRule,
-    }, ["itemId", "quote", "recordId", "revision"]));
+    }, ["itemId", "quote", "recordId", "revision"]), attempt);
+    const writer = await recordStage("post-writer", () => executeSkill("post-writer", writerInput, ["itemId", "text"]));
+    if (writer.verdict === "BLOCKED") return writer.report;
+    let draft = oneDraft(writer);
+    if (!draft) return "The writer did not return one revised draft for this post.";
+    let qa = await checkDraft(draft, 1);
+    const earlierQa = [];
+    for (let round = 1; qa.verdict === "REVISE" && round <= maxQaFixRounds; round += 1) {
+      earlierQa.push({ ...qa, fixRound: round - 1 });
+      const revised = await recordStage("post-writer", () => executeSkill("post-writer", {
+        ...writerInput, previousDrafts: [draft], qaFeedback: qa.report, fixRound: round, handoffRule: qaFixHandoffRule,
+      }, ["itemId", "text"]), round + 1);
+      if (revised.verdict === "BLOCKED") return revised.report;
+      draft = oneDraft(revised);
+      if (!draft) return "The writer did not return one revised draft for this post.";
+      qa = await checkDraft(draft, round + 1);
+    }
 
     const { agent, destinations } = await gate2Options(brand, project, run);
     const destination = channelKey(agent?.destination) || channelKey(run.channel);
@@ -596,7 +638,8 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
       if (!moved.matchedCount) throw new Error("The post changed during regeneration.");
       await drafts.insertOne({
         ...scope, _id: draftVersionId, contentItemId: post._id, version: previous.version + 1, text: draft.text,
-        qaChecks: [finalQa], claims, claimPermissionsVerified: claimsPassed, comments: [],
+        qaChecks: [finalQa], qaFixRounds: earlierQa.length, qaFixHistory: earlierQa,
+        claims, claimPermissionsVerified: claimsPassed, comments: [],
         createdAt: now, createdByUserId: job.requestedByUserId,
         regeneratedFromDraftVersionId: previous._id, reviewerFeedback: job.feedback,
         changeSummary: "Regenerated from reviewer feedback",

@@ -29,6 +29,24 @@ Any other BLOCKED package does block it.
 Runs started before this change have no saved packages. When they reach drafting, the
 missing packages are assembled once (Post Writer + QA only) and saved.
 
+## Automatic QA fix rounds
+
+When the Post Quality Analyst returns REVISE, the Post Writer rewrites the drafts with the QA
+report (`qaFeedback`) and QA checks them again. This happens at most **2 times**
+(`maxQaFixRounds`), for the first drafting and for every feedback regeneration. After that the
+last QA result stands: PASS opens Gate 2; REVISE leaves the post as a draft with the QA note.
+Each rewrite is its own stage execution (`attempt` 2, 3). The draft version keeps the final QA
+result in `qaChecks` (unchanged) and adds `qaFixRounds` and `qaFixHistory` (earlier QA results).
+A run with fix rounds makes up to 9 calls instead of 5.
+
+## Roles
+
+Brand roles are now `brand_manager`, `operator`, `approver` and `viewer` (were `knowledge_admin`
+and `marketing_operator`). Run `MONGODB_URI=... node scripts/rename-roles.mjs` once before
+deploying; it updates existing users and the `users` validator. Viewers can read every brand page
+(runs, posts, knowledge, records, audit) and change nothing. Gate 1 has one reviewer: the
+operator who owns the run, or the brand's named approver when the owner isn't an operator.
+
 ## Post review: feedback and regenerate
 
 There is no approve or reject at post review any more:
