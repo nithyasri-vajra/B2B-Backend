@@ -72,7 +72,10 @@ const google = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, origin +
 const app = express();
 const auth = express.Router();
 app.use(path, auth);
-auth.use(express.json({ limit: "16kb" }));
+// Small JSON bodies everywhere, except saving an edited knowledge file, which can be as large as an upload (2 MB).
+const smallJson = express.json({ limit: "16kb" });
+const knowledgeJson = express.json({ limit: "3mb" });
+auth.use((req, res, next) => (/\/knowledge\/records\/[^/]+\/revisions$/.test(req.path) ? knowledgeJson : smallJson)(req, res, next));
 auth.use((req, res, next) => {
   res.set("Cache-Control", "no-store");
   if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && req.get("origin") !== origin)
