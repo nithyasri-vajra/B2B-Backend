@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { extname } from "node:path";
 import { finished } from "node:stream/promises";
 import express, { raw } from "express";
+import { modelStatus, skillStatus } from "./skill-status.js";
 import { GridFSBucket, ObjectId } from "mongodb";
 
 const maxKnowledgeFileBytes = 2 * 1024 * 1024;
@@ -555,6 +556,6 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
       "versions.version": 1, "versions.pipeline.stageKey": 1, "versions.pipeline.order": 1,
       "versions.pipeline.gate": 1, "versions.runLimits": 1, "versions.briefTemplate.version": 1,
     }).sort({ name: 1 }).toArray();
-    res.json({ agents: rows });
+    res.json({ agents: rows, skills: skillStatus(), openai: modelStatus() });
   });
 }
