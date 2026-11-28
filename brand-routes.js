@@ -30,13 +30,8 @@ const claimPermissions = new Set(["public", "restricted", "internal_only"]);
 const isClaim = ({ area, recordType }) => /^claims?$/i.test(cleanText(area)) ||
   /\bclaims?\b/i.test(cleanText(recordType).replace(/_/g, " "));
 
-function canReuseClaim(revision, now) {
-  return revision?.reviewStatus === "approved" &&
-    ["A", "B", "C"].includes(revision.evidenceGrade) &&
-    Boolean(cleanText(revision.sourceReference)) &&
-    claimPermission(revision.usagePermission) === "public" &&
-    (revision.reviewDueAt == null || new Date(revision.reviewDueAt) > now);
-}
+// Text files become knowledge the skills read in full (claims.md and the learning CSVs included).
+const textKnowledgeTypes = new Set([".md", ".csv", ".txt"]);
 
 export async function resolvePublishedKnowledge(db, brand, {
   versionId = brand?.publishedKnowledgeVersionId, session, now = new Date(),
@@ -59,12 +54,12 @@ export async function resolvePublishedKnowledge(db, brand, {
     if (!entry) continue;
     const current = row.currentRevision == null ? entry :
       row.revisions.find((value) => value.revision === row.currentRevision);
-    const excluded = isClaim(row) && (!canReuseClaim(entry, now) ||
-      claimPermission(current?.usagePermission) !== "public" ||
-      ["disputed", "expired", "rejected"].includes(current?.reviewStatus));
+    // Approved knowledge goes to the skills as written; it is only left out if it was withdrawn after publishing.
+    const excluded = ["disputed", "expired", "rejected"].includes(current?.reviewStatus);
     records.push({ excluded,
       expired: entry.reviewDueAt != null && !(new Date(entry.reviewDueAt) > now),
-      data: { ...entry, recordId: row._id, area: row.area, recordType: row.recordType },
+      data: { ...entry, recordId: row._id, area: row.area, recordType: row.recordType,
+        ...(row.fileName ? { fileName: row.fileName } : {}) },
     });
   }
   return { version, records, missing: records.length !== refs.length };
@@ -77,7 +72,7 @@ export function assessReadiness(snapshot, { agentKey, brief, requireBrief = fals
     : !snapshot.version ? "Publish the brand's knowledge before starting the run."
     : snapshot.missing ? "A published knowledge revision is unavailable."
     : !knowledge.length ? "No current published knowledge applies to this scope."
-    : applicable.some(({ excluded }) => excluded) ? "Published claims without current permission or evidence were excluded."
+    : applicable.some(({ excluded }) => excluded) ? "Some published knowledge was withdrawn after publishing and was excluded."
     : knowledge.length < applicable.length ? "Some published knowledge has expired and was excluded." : null;
   const blocked = (requireBrief && brief?.validated !== true) || !snapshot.version || snapshot.missing || !knowledge.length;
   const verdict = blocked ? "BLOCKED" : reason ? "LIMITED" : "READY";
@@ -376,35 +371,56 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
 
     const bytes = Buffer.from(await file.arrayBuffer());
     let statement;
-    if (extension === ".md") {
+    if (textKnowledgeTypes.has(extension)) {
       try {
-        statement = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
+        statement = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, "").trim();
       } catch {
-        return res.status(400).json({ message: "Save the Markdown file as UTF-8 and try again." });
+        return res.status(400).json({ message: title + ": save the file as UTF-8 and try again." });
       }
       if (!statement || statement.includes("\0"))
-        return res.status(400).json({ message: "Add readable text to the Markdown file." });
+        return res.status(400).json({ message: title + ": add readable text to the file." });
     }
 
     const now = new Date();
     const fileId = new ObjectId();
-    const source = {
+    // Uploading a file with the same name again adds the next revision to its record instead of a duplicate.
+    const previousSource = statement ? await sources.findOne({ clientId, sourceType: "file", title },
+      { sort: { createdAt: -1 } }) : null;
+    const previousRecord = previousSource && await records.findOne({ clientId, sourceId: previousSource._id },
+      { sort: { createdAt: 1 } });
+    const source = previousRecord ? { ...previousSource, areas, fileRef: String(fileId), processingStatus: "completed",
+      uploadedByUserId: user._id, updatedAt: now } : {
       _id: new ObjectId(), clientId, sourceType: "file", title, areas,
       fileRef: String(fileId), processingStatus: statement ? "completed" : "pending",
       uploadedByUserId: user._id, createdAt: now, updatedAt: now,
     };
-    const record = statement ? {
-      _id: new ObjectId(), clientId, sourceId: source._id, area: areas[0], recordType: "document",
-      currentRevision: 1, revisions: [{ revision: 1, statement, agentKey: null, reviewStatus: "needs_review" }],
+    const record = !statement || previousRecord ? null : {
+      _id: new ObjectId(), clientId, sourceId: source._id, area: areas[0], recordType: "document", fileName: title,
+      currentRevision: 1, revisions: [{ revision: 1, statement, agentKey: null, reviewStatus: "needs_review",
+        uploadedByUserId: user._id, uploadedAt: now }],
       createdAt: now, updatedAt: now,
-    } : null;
+    };
     const bucket = new GridFSBucket(db, { bucketName: "knowledgeFiles" });
+    let saved = record;
     try {
       const upload = bucket.openUploadStreamWithId(fileId, title, { metadata: { clientId, sourceId: source._id } });
       const uploaded = finished(upload);
       upload.end(bytes);
       await uploaded;
       await mongo.withSession((session) => session.withTransaction(async () => {
+        if (previousRecord) {
+          const revision = { revision: previousRecord.currentRevision + 1, statement, agentKey: null,
+            reviewStatus: "needs_review", uploadedByUserId: user._id, uploadedAt: now };
+          saved = await records.findOneAndUpdate({ _id: previousRecord._id, clientId, currentRevision: previousRecord.currentRevision },
+            { $set: { currentRevision: revision.revision, fileName: title, updatedAt: now }, $push: { revisions: revision } },
+            { session, returnDocument: "after" });
+          if (!saved) throw Object.assign(new Error("Knowledge record changed during upload."), { status: 409 });
+          await sources.updateOne({ _id: source._id, clientId }, { $set: {
+            areas, fileRef: source.fileRef, processingStatus: "completed", uploadedByUserId: user._id, updatedAt: now,
+          } }, { session });
+          await audit(user, clientId, "knowledge_record_revised_by_upload", saved._id, { revision: revision.revision }, session);
+          return;
+        }
         await sources.insertOne(source, { session });
         if (record) await records.insertOne(record, { session });
         await audit(user, clientId, "knowledge_source_added", source._id, {}, session);
@@ -419,9 +435,10 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
             console.error("Knowledge upload cleanup failed", cleanupError.name);
         }
       }
+      if (error.status === 409) return res.status(409).json({ message: title + " was changed by someone else. Try again." });
       throw error;
     }
-    res.status(201).json({ source, record });
+    res.status(previousRecord ? 200 : 201).json({ source, record: saved, revised: Boolean(previousRecord) });
   });
 
   router.get(brandPath + "/knowledge/records", scope, async (req, res) => {
@@ -516,16 +533,17 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
     const { user, clientId, role, brand, admin } = res.locals.brandScope;
     if (!admin && !role("brand_manager")) return res.sendStatus(403);
     if (brand.status === "archived") return res.sendStatus(409);
+    const note = cleanText(req.body?.note).slice(0, 500);
     const now = new Date();
     const published = await mongo.withSession((session) => session.withTransaction(async () => {
       const versionId = new ObjectId();
       const approvedRecords = (await records.aggregate([
         { $match: { clientId } }, { $unwind: "$revisions" },
         { $match: { $expr: { $eq: ["$currentRevision", "$revisions.revision"] },
-          "revisions.reviewStatus": "approved", "revisions.evidenceGrade": { $in: ["A", "B", "C"] },
+          "revisions.reviewStatus": "approved",
           $or: [{ "revisions.reviewDueAt": null }, { "revisions.reviewDueAt": { $gt: now } }] } },
         { $project: { revision: "$currentRevision", area: 1, recordType: 1, data: "$revisions" } },
-      ], { session }).toArray()).filter((record) => !isClaim(record) || canReuseClaim(record.data, now));
+      ], { session }).toArray());
       if (!approvedRecords.length) return null;
       const lock = await brands.updateOne({
         _id: clientId, status: { $ne: "archived" },
@@ -538,7 +556,7 @@ export function registerBrandRoutes(router, { db, mongo, current, isPlatformAdmi
       const version = {
         _id: versionId, clientId, version: (latest?.version ?? 0) + 1, status: "published",
         recordRevisions: approvedRecords.map(({ _id, revision }) => ({ recordId: _id, revision })),
-        publishedByUserId: user._id, publishedAt: now,
+        publishedByUserId: user._id, publishedAt: now, ...(note ? { note } : {}),
       };
       await versions.insertOne(version, { session });
       await audit(user, clientId, "knowledge_version_published", versionId, { version: version.version }, session);

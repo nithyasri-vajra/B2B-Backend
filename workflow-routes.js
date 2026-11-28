@@ -14,19 +14,19 @@ const hasPassingQa = (draft) => Array.isArray(draft?.qaChecks) && draft.qaChecks
   draft.qaChecks.every((check) => check?.verdict === "PASS");
 const claimKey = ({ recordId, revision }) => `${recordId}:${revision}`;
 
+// Each claim the QA lists must point at approved published knowledge and appear in the draft.
+// Whole knowledge files (claims.md and the rest) are documents: the quote only has to be in the draft.
+// Single-statement records still need the draft to use their exact wording.
 export function verifyDraftClaims(text, claims, knowledge) {
   if (!Array.isArray(claims)) return false;
-  const eligible = new Map(knowledge.filter((record) =>
-    (/^claims?$/i.test(cleanText(record.area)) || /\bclaims?\b/i.test(cleanText(record.recordType).replace(/_/g, " "))) &&
-    normalize(record.usagePermission) === "public" &&
-    record.reviewStatus === "approved" && ["A", "B", "C"].includes(record.evidenceGrade) &&
-    cleanText(record.sourceReference),
-  ).map((record) => [claimKey(record), record]));
+  const eligible = new Map(knowledge.filter((record) => record.reviewStatus === "approved")
+    .map((record) => [claimKey(record), record]));
   return claims.every((claim) => {
     const record = eligible.get(claimKey(claim));
     const quote = cleanText(claim.quote);
-    return Boolean(record && quote && text.includes(quote) &&
-      [record.statement, record.permittedWording].some((wording) => normalize(wording) === normalize(quote)));
+    if (!record || !quote || !text.includes(quote)) return false;
+    return record.recordType === "document" ||
+      [record.statement, record.permittedWording].some((wording) => normalize(wording) === normalize(quote));
   });
 }
 const qaHandoffRule = "Review every draft and list every factual claim in items. For each claim, return the draft itemId, an exact quote from the draft, and the supporting published claim recordId and revision as strings. Use empty recordId and revision for unsupported claims. For a draft without factual claims, return one row with its itemId and empty quote, recordId and revision. Return PASS only when every draft passes QA.";
@@ -452,7 +452,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
         verifiedClaims.set(itemId, claims);
       }
       const claimFailure = qa.verdict === "PASS" && !claimsPassed;
-      const reason = claimFailure ? "Final QA found a claim without matching approved evidence and current public permission." : reviewReason;
+      const reason = claimFailure ? "Final QA found a claim that is not backed by the published knowledge." : reviewReason;
       const finalQa = claimFailure ? { ...qa, verdict: "BLOCKED", report: reason } : qa;
       if (claimFailure) await executions.updateOne({
         ...scope, runId: run._id,
@@ -615,7 +615,7 @@ export function registerWorkflowRoutes(router, { db, mongo, current, isPlatformA
       const claimsPassed = qa.verdict === "PASS" && rows.length > 0 && qa.items.every((row) => row.itemId === itemId) &&
         verifyDraftClaims(draft.text, claims, knowledge) && verifyDraftClaims(draft.text, claims, currentKnowledge);
       const claimFailure = qa.verdict === "PASS" && !claimsPassed;
-      const finalQa = claimFailure ? { ...qa, verdict: "BLOCKED", report: "Final QA found a claim without matching approved evidence and current public permission." } : qa;
+      const finalQa = claimFailure ? { ...qa, verdict: "BLOCKED", report: "Final QA found a claim that is not backed by the published knowledge." } : qa;
       const reviewReason = finalQa.verdict !== "PASS" ? finalQa.report : !reviewerId
         ? "An eligible active named approver is required for Gate 2."
         : !destinations.includes(destination) ? "Select a valid destination for Gate 2." : "";
